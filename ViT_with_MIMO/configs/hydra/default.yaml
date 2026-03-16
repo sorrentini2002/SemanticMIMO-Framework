@@ -1,0 +1,6 @@
+run:
+  # Rimuoviamo ${method.parameters} che causa il crash su Windows
+  dir: ${core.results_path}/${hyperparameters.experiment_name}/${dataset.name}/${model.model_name}/${method.name}/comm=${communication.name}
+
+job:
+  chdir: No

@@ -1,0 +1,16 @@
+model:
+  _target_: methods.proposal.model
+  desired_compression: ${..parameters.desired_compression}
+  token_compression: ${..parameters.token_compression}
+  batch_compression: ${..parameters.batch_compression}
+  pooling: ${..parameters.pooling}
+name: proposal
+parameters:
+  desired_compression: null
+  token_compression: null
+  batch_compression: null
+  pooling: attention
+#model:
+#  _target_: methods.proposal.NameOfClass
+#  compression: 0.2
+#Use NameOfClass instead of "name: proposal" as before

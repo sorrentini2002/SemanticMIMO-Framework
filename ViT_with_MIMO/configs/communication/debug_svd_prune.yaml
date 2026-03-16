@@ -1,0 +1,49 @@
+# MIMO debug profile: rayleigh + SVD allocation with pruning enabled
+name: debug_svd_prune
+
+channel:
+  _target_: comm.comm_module_wrapper.CommModuleWrapper
+  input_dim: 192
+  config:
+    comm: ${communication.comm}
+
+comm:
+  enabled: true
+  bottleneck:
+    enabled: true
+    out_dim: 128
+  channel:
+    enabled: true
+    type: "mimo"
+    n_tx: 4
+    n_rx: 4
+    fading: "rayleigh"
+    equalizer: "mmse"
+    snr_db: [20, 20]
+    train_mode: "fixed"
+    sample_mode: "per_sample"
+    normalize: true
+    normalization_mode: "sample"
+    mode_alloc:
+      enabled: true
+      svd:
+        per_sample: true
+      prune:
+        enabled: true
+        sigma_rel_threshold: 0.1
+      assignment:
+        enabled: true
+        granularity: "token"
+        chunk_size: 1
+        prioritize_cls: true
+      power:
+        enabled: true
+        alpha: 1.0
+        eps: 1.0e-4
+      num_modes: null
+    power_alloc:
+      enabled: false
+      source: "selection_scores"
+      alpha: 1.0
+      eps: 1.0e-4
+      apply_to_cls: false

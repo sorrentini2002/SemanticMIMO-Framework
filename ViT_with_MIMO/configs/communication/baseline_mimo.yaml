@@ -1,0 +1,32 @@
+# Hard CIFAR baseline with MIMO AWGN channel.
+name: "baseline_mimo"
+
+channel:
+  _target_: comm.comm_module_wrapper.CommModuleWrapper
+  input_dim: 192
+  config:
+    comm: ${communication.comm}
+
+comm:
+  enabled: true
+  bottleneck:
+    enabled: true
+    out_dim: 128
+  channel:
+    enabled: true
+    type: "mimo"
+    n_tx: 4
+    n_rx: 4
+    fading: "identity"        # rayleigh | identity | diagonal
+    equalizer: "mmse"         # mmse | zf
+    snr_db: [0, 20]
+    train_mode: "sampled"
+    sample_mode: "per_sample"
+    normalize: true
+    normalization_mode: "sample"
+    power_alloc:
+      enabled: false
+      source: "selection_scores"  # selection_scores | uniform | attention_cls
+      alpha: 1.0
+      eps: 1.0e-4
+      apply_to_cls: false
