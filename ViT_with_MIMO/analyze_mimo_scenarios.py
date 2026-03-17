@@ -62,7 +62,7 @@ def parse_results_to_dict(base_dir):
         config = extract_config_from_overrides(folder)
         
         # Fallback for non-multirun folders (extracting from folder name)
-        if config["communication"] == "Unknown":
+        if config.get("communication", "Unknown") == "Unknown":
             folder_name = os.path.basename(folder)
             if "comm=" in folder_name:
                 config["communication"] = folder_name.split("comm=")[-1].split("_")[0]
