@@ -208,20 +208,3 @@ With content:
     ]
 }
 ```
-
----
-
-## Main differences from previous version
-
-| Aspect | Previous version | Current version |
-|---|---|---|
-| Path handling | `os.path.join`, `glob.glob` | `pathlib.Path`, `Path.rglob()` |
-| Logging | `print()` | Structured `logging` (INFO / WARNING / ERROR) |
-| `parse_value` | Duplicated inline logic | Dedicated helper function |
-| YAML error handling | Generic `except Exception` | Separated `except yaml.YAMLError` + `except Exception` |
-| Fallback config | Hardcoded `"comm="` pattern only | Generic for any `"key=value"`, ascending tree |
-| Parameter analysis | Inline in `main()` | Dedicated `analyze_parameters()` function |
-| Output structure | Folder hierarchy for constant parameters | Flat file with explicit metadata in JSON |
-| `KeyError` bug on `config["communication"]` | Present | Removed (fallback never accesses keys without verifying existence) |
-| Unused `import re` | Present | Removed |
-| Type hints | Absent | Present on all functions |
