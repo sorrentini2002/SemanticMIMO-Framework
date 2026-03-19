@@ -218,14 +218,40 @@ def training_schedule(model, train_data_loader, val_data_loader, optimizer, max_
                 val_losses.append(avg_val_loss)
                 val_accuracies.append(avg_val_accuracy)
 
+            # Determine if this is the "best" epoch based on dataset criteria
+            criterion = cfg.dataset.get('selection_criterion', 'average')
+            
+            is_best = False
+            current_comparison_metric = avg_val_accuracy
+
+            if criterion == 'last':
+                is_best = True
+            elif criterion == 'max_noise' and snr_sweep:
+                min_snr_val = min(snr_sweep)
+                current_comparison_metric = val_acc_dict[str(min_snr_val)]
+                is_best = (current_comparison_metric >= best_val_accuracy)
+            elif criterion == 'min_noise' and snr_sweep:
+                max_snr_val = max(snr_sweep)
+                current_comparison_metric = val_acc_dict[str(max_snr_val)]
+                is_best = (current_comparison_metric >= best_val_accuracy)
+            elif criterion == 'snr_index' and snr_sweep:
+                idx = cfg.dataset.get('selection_snr_index', 0)
+                idx = min(max(0, idx), len(snr_sweep) - 1)
+                snr_val = snr_sweep[idx]
+                current_comparison_metric = val_acc_dict[str(snr_val)]
+                is_best = (current_comparison_metric >= best_val_accuracy)
+            else: # average
+                current_comparison_metric = avg_val_accuracy
+                is_best = (current_comparison_metric >= best_val_accuracy)
+
             # Store general results 
             train_losses.append(avg_train_loss)
             train_accuracies.append(avg_train_accuracy)
             communication_cost.append(model.communication)
 
-            # Update best stats if current validation accuracy is better
-            if avg_val_accuracy >= best_val_accuracy:
-                best_val_accuracy = avg_val_accuracy
+            # Update best stats if criteria is met
+            if is_best:
+                best_val_accuracy = current_comparison_metric
                 top_imp_frac = repr_v_stats.get("mode_alloc_top_imp_frac")
                 if top_imp_frac is None:
                     top_imp_frac = repr_v_stats.get("stream_alloc_top_imp_frac")

@@ -1,75 +1,106 @@
-import os
+# -*- coding: utf-8 -*-
 import json
-import glob
 import argparse
 import yaml
-import re
+import logging
+from pathlib import Path
+from typing import Dict, Any, List, Tuple
 
-def extract_config_from_overrides(folder_path):
-    """Parses .hydra/overrides.yaml to extract all run conditions generically."""
+# Configurazione logging
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+logger = logging.getLogger(__name__)
+
+def parse_value(value_str: str) -> Any:
+    """Tenta la conversione di una stringa in float o int."""
+    try:
+        if "." in value_str:
+            return float(value_str)
+        return int(value_str)
+    except ValueError:
+        return value_str
+
+def extract_config_from_overrides(folder_path: Path) -> Dict[str, Any]:
+    """Svolge il parsing di .hydra/overrides.yaml catturando le eccezioni correttamente."""
     config = {}
+    overrides_path = folder_path / ".hydra" / "overrides.yaml"
     
-    overrides_path = os.path.join(folder_path, ".hydra", "overrides.yaml")
-    if os.path.exists(overrides_path):
-        with open(overrides_path, 'r') as f:
-            try:
+    if overrides_path.exists():
+        try:
+            with open(overrides_path, 'r', encoding='utf-8') as f:
                 overrides = yaml.safe_load(f)
+                
+                if not overrides:
+                    return config
+                
                 for item in overrides:
                     if "=" in item:
                         key, value = item.split("=", 1)
                         # Clean key (e.g. method.parameters.desired_compression -> desired_compression)
                         clean_key = key.split(".")[-1]
-                        # Try to convert to float/int if possible
-                        try:
-                            if "." in value: value = float(value)
-                            else: value = int(value)
-                        except:
-                            pass
-                        config[clean_key] = value
-            except Exception as e:
-                print(f"Warning: Could not parse overrides in {folder_path}: {e}")
-                
+                        config[clean_key] = parse_value(value)
+                        
+        except yaml.YAMLError as e:
+            logger.warning(f"Errore parsing YAML in {overrides_path}: {e}")
+        except Exception as e:
+            logger.error(f"Errore sconosciuto leggendo {overrides_path}: {e}")
+            
     return config
 
-def parse_results_to_dict(base_dir):
-    """
-    Scans the base directory for best_training_results.json files and aggregates them.
-    Returns a list of dictionaries containing both config and metrics.
-    """
-    # 1. Find all best result files
-    all_files = glob.glob(os.path.join(base_dir, "**", "best_training_results.json"), recursive=True)
+def extract_fallback_config(folder_path: Path) -> Dict[str, str]:
+    """Recupera la configurazione dai folder padre se overrides.yaml non � presente."""
+    config = {}
+    folder_name = folder_path.name
+    # Generalizza il fallback (non solo 'comm=')
+    if "=" in folder_name:
+        parts = folder_name.split("=", 1)
+        if len(parts) == 2:
+            key, val = parts
+            config[key] = val
+    return config
+
+def parse_results_to_dict(base_dir: Path) -> List[Dict[str, Any]]:
+    """Cerca e raccoglie tutti i risultati dalle cartelle specificate."""
+    # 1. Cerca 'best_training_results.json', fallback su 'final_training_results.json'
+    all_files = list(base_dir.rglob("best_training_results.json"))
     if not all_files:
-        all_files = glob.glob(os.path.join(base_dir, "**", "final_training_results.json"), recursive=True)
+        all_files = list(base_dir.rglob("final_training_results.json"))
 
     if not all_files:
-        print(f"No result files found in {base_dir}")
+        logger.warning(f"Nessun file risultato trovato in {base_dir}")
         return []
 
     aggregated_data = []
 
     for fp in all_files:
-        folder = os.path.dirname(fp)
+        folder = fp.parent
         
         # Load the best metrics
-        with open(fp, 'r') as f:
-            try:
+        try:
+            with open(fp, 'r', encoding='utf-8') as f:
                 metrics = json.load(f)
-            except json.JSONDecodeError:
-                print(f"Warning: Could not decode JSON in {fp}")
-                continue
+        except json.JSONDecodeError as e:
+            logger.warning(f"Decodifica JSON fallita in {fp}: {e}")
+            continue
+        except Exception as e:
+            logger.warning(f"Errore leggendo JSON in {fp}: {e}")
+            continue
 
-        # Extract config (conditions)
+        # Extract config
         config = extract_config_from_overrides(folder)
         
-        # Fallback for non-multirun folders (extracting from folder name)
-        if config.get("communication", "Unknown") == "Unknown":
-            folder_name = os.path.basename(folder)
-            if "comm=" in folder_name:
-                config["communication"] = folder_name.split("comm=")[-1].split("_")[0]
+        # Generalised Fallback
+        if not config:
+            current = folder
+            # Scala l'albero fino alla root (multirun, results..) cercando folder key=value
+            while current != base_dir and current.name not in ["results", "multirun", "analysis_results"]:
+                fb = extract_fallback_config(current)
+                for k, v in fb.items():
+                    if k not in config:
+                        config[k] = v
+                current = current.parent
 
-        # Combine into a single entry
         entry = {
-            "source_path": fp,
+            "source_path": str(fp),
             "conditions": config,
             "best_epoch_stats": metrics
         }
@@ -78,22 +109,8 @@ def parse_results_to_dict(base_dir):
 
     return aggregated_data
 
-def main():
-    parser = argparse.ArgumentParser(description="Adaptive Aggregate MIMO Split Learning Results")
-    parser.add_argument("--results_dir", type=str, default="multirun", help="Path to multirun or results directory")
-    parser.add_argument("--base_output_dir", type=str, default="analysis_results", help="Base directory for the nested output")
-    
-    args = parser.parse_args()
-    
-    print(f"Scanning for results in: {args.results_dir}")
-    all_data = parse_results_to_dict(args.results_dir)
-    
-    if not all_data:
-        print("No data found to aggregate.")
-        return
-
-    # 1. Identify which parameters are constant and which are variables
-    # We look through ALL loaded data to see how many unique values each parameter has
+def analyze_parameters(all_data: List[Dict[str, Any]]) -> Tuple[List[str], List[str]]:
+    """Identifica parametri Costanti (Hierarchy) vs Variabili (Comparison)."""
     all_keys = set()
     for entry in all_data:
         all_keys.update(entry["conditions"].keys())
@@ -103,50 +120,74 @@ def main():
         for k, v in entry["conditions"].items():
             param_unique_values[k].add(str(v))
             
-    # Decision: 
-    # - If value count == 1 -> HIERARCHY (Folder)
-    # - If value count > 1 -> COMPARISON (Inside JSON)
-    HIERARCHY_PARAMS = [k for k, v in param_unique_values.items() if len(v) == 1]
-    COMPARISON_PARAMS = [k for k, v in param_unique_values.items() if len(v) > 1]
+    # Decisione parametri:
+    hierarchy_params = [k for k, v in param_unique_values.items() if len(v) <= 1]
+    comparison_params = [k for k, v in param_unique_values.items() if len(v) > 1]
     
-    print(f"Detected Hierarchy (Constants): {HIERARCHY_PARAMS}")
-    print(f"Detected Comparison (Variables): {COMPARISON_PARAMS}")
+    return sorted(hierarchy_params), sorted(comparison_params)
 
-    # 2. Group data by their hierarchy keys
-    grouped_results = {}
-    for entry in all_data:
-        conds = entry["conditions"]
-        path_parts = []
-        # Create hierarchy based on constants
-        # Sort HIERARCHY_PARAMS for consistent path structure
-        for p in sorted(HIERARCHY_PARAMS):
-            path_parts.append(f"{p}_{conds[p]}")
+def save_flat_results(args: argparse.Namespace, all_data: List[Dict[str, Any]], hierarchy_params: List[str], comparison_params: List[str]):
+    """Salva i dati aggressati in una struttura piatta evitando Path too long e usando meta-dati."""
+    target_dir = Path(args.base_output_dir)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Versioning unificato base
+    final_output_dir = target_dir / "analysis_flat"
+    counter = 1
+    while final_output_dir.exists():
+        final_output_dir = target_dir / f"analysis_flat_{counter}"
+        counter += 1
         
-        hierarchy_path = os.path.join(*path_parts) if path_parts else "varied_runs"
-        
-        if hierarchy_path not in grouped_results:
-            grouped_results[hierarchy_path] = []
-        grouped_results[hierarchy_path].append(entry)
+    final_output_dir.mkdir(parents=True, exist_ok=True)
+    output_file = final_output_dir / "comparison_results.json"
+    
+    # Estrae i parametri costanti come metadata
+    constant_metadata = {}
+    if all_data:
+        # Essendo costanti (stesso valore per ogni run), guardiamo il primo entry
+        first_conditions = all_data[0]["conditions"]
+        for p in hierarchy_params:
+            if p in first_conditions:
+                constant_metadata[p] = first_conditions[p]
 
-    # 3. Save each group into its nested directory
-    for rel_path, items in grouped_results.items():
-        target_dir = os.path.join(args.base_output_dir, rel_path)
+    output_payload = {
+        "metadata": {
+            "constant_parameters": constant_metadata,
+            "variable_parameters": comparison_params,
+            "total_runs": len(all_data)
+        },
+        "runs": all_data
+    }
         
-        # Versioning: analysis, analysis_1, etc.
-        base_analysis_dir = os.path.join(target_dir, "analysis")
-        final_output_dir = base_analysis_dir
-        counter = 1
-        while os.path.exists(final_output_dir):
-            final_output_dir = f"{base_analysis_dir}_{counter}"
-            counter += 1
-            
-        os.makedirs(final_output_dir, exist_ok=True)
-        
-        output_file = os.path.join(final_output_dir, "comparison_results.json")
-        with open(output_file, 'w') as f:
-            json.dump(items, f, indent=4)
-            
-        print(f"Saved {len(items)} runs to: {output_file}")
+    try:
+        with open(output_file, 'w', encoding='utf-8') as f:
+            json.dump(output_payload, f, indent=4)
+        logger.info(f"Salvato con successo l'aggregazione di {len(all_data)} runs in: {output_file}")
+    except Exception as e:
+        logger.error(f"Errore durante il salvataggio dei risultati in {output_file}: {e}")
+
+def main():
+    parser = argparse.ArgumentParser(description="Adaptive Aggregate MIMO Split Learning Results")
+    # Usa 'results' come default dato il folder context visibile (puoi passare --results_dir multirun)
+    parser.add_argument("--results_dir", type=str, default="results", help="Path to multirun or results directory")
+    parser.add_argument("--base_output_dir", type=str, default="analysis_results", help="Base directory for the output")
+    
+    args = parser.parse_args()
+    results_dir = Path(args.results_dir)
+    
+    logger.info(f"Ricerca risultati in corso per: {results_dir}")
+    
+    all_data = parse_results_to_dict(results_dir)
+    if not all_data:
+        logger.warning("Nessun dato trovato da aggregare. Uscita.")
+        return
+
+    hierarchy_params, comparison_params = analyze_parameters(all_data)
+    
+    logger.info(f"Parametri Costanti rilevati (Metadata): {hierarchy_params}")
+    logger.info(f"Parametri Variabili rilevati (Confronto): {comparison_params}")
+
+    save_flat_results(args, all_data, hierarchy_params, comparison_params)
 
 if __name__ == "__main__":
     main()
