@@ -1,43 +1,62 @@
-# Report: Integration of ViT Intermediate Bottleneck with MIMO Channel
+# Integration of ViT Intermediate Bottleneck with MIMO Channel
 
-## 1. Overview
-The merged codebase implements an advanced Split Learning architecture that bridges a Vision Transformer (ViT) with a simulated physical wireless layer. Specifically, intermediate representations (compressed image patch tokens) are transmitted from a client to a server over a simulated **Multiple-Input Multiple-Output (MIMO)** wireless channel. 
+## 1. Project Overview
+This repository implements an advanced Split Learning architecture that bridges a **Vision Transformer (ViT)** with a simulated physical wireless layer. This framework enables the transmission of intermediate representations (compressed image patch tokens) from a client to a server over a simulated **Multiple-Input Multiple-Output (MIMO)** wireless channel.
 
-The most defining feature of this integration is its **Joint Source-Channel Coding (JSCC)** optimization: the system extracts and leverages the ViT's self-attention scores (the semantic "importance" of each image patch) to dynamically dictate the physical layer allocation of transmit power, antennas, and spatial streams. 
+The core of this integration relies on **Joint Source-Channel Coding (JSCC)** optimization: the system extracts the ViT's self-attention scores (the semantic importance of each image patch) and uses them to dynamically allocate physical layer resources such as transmit power, antennas, and spatial streams. Instead of treating all data packets equally, the model "defends" the most relevant information based on channel conditions and token importance.
 
-## 2. Architectural Highlights & New Features
-*   **MIMO Channel Simulation**: Native PyTorch realization of a generic $N_{tx} \times N_{rx}$ MIMO channel with varying fading distributions (Rayleigh, Diagonal, Identity) and Additive White Gaussian Noise (AWGN).
-*   **Signal Equalization**: Uses robust Zero-Forcing (ZF) or Minimum Mean Square Error (MMSE) linear equalizers at the receiver end to reconstruct the transmitted ViT tokens.
-*   **Attention-Guided Physical Allocation**:
-    *   **Power Allocation**: Adjusts transmit power per token globally. Important ViT patches are dynamically given higher transmit power amplitudes, improving their resilience against noise.
-    *   **Stream/Antenna Assignment**: Ranks physical antennas by gain matrices and assigns the most important payload tokens to the antennas with the strongest channels.
-    *   **SVD Spatial Multiplexing**: For complex interference channels (Rayleigh fading), the transmitter computes the Singular Value Decomposition (SVD) of the channel matrix to discover independent orthogonal paths (eigenmodes). The most attention-heavy tokens are projected precisely onto the strongest eigenmodes.
+---
 
-## 3. Detailed File Breakdown
+## 2. Key Architectural Features
 
-### `comm/mimo.py`
-This file introduces the core signal processing math needed to simulate the physical layer inside a deep learning pipeline.
-*   **`MIMOAWGNChannel`**: An `nn.Module` managing physical channel states ($Y = HS + N$). It is strictly responsible for sampling channel fading gains, calculating accurate noise bounds based on target SNR, and executing matrix inversions for ZF/MMSE equalizers.
-*   **Dimensionality Transformation**: Introduces `pack_tokens_to_mimo_symbols` to map a 3D token tensor $(Batch, Tokens, D_{sent})$ into a packed, zero-padded 2D antenna grid $(Batch, N_{tx}, T_{time})$ representing actual physical transmissions over time periods. 
+### 📡 Advanced MIMO Channel Simulation
+* **MIMO Channel (MIMOAWGNChannel)**: Native PyTorch implementation of an {tx} \times N_{rx}$ MIMO channel with simulated fading distributions (Rayleigh, Diagonal, Identity) and AWGN noise.
+* **Signal Equalization**: Uses robust **Zero-Forcing (ZF)** and **Minimum Mean Square Error (MMSE)** linear equalizers at the receiver end to accurately reconstruct the tokens transmitted by the ViT.
+* **Dynamic Configuration Resolution**: Native support for complex structured inputs like ListConfig (e.g., dynamic SNR sweeps) managed resiliently during execution.
 
-### `comm/comm_module.py`
-This acts as the pipeline controller handling the end-to-end `Compressor -> Channel -> Decompressor` bottleneck strategy.
-*   **Token Reordering & Mode Allocation**: Implements the complex routing logic utilizing the attention scores (`_resolve_stream_alloc_scores`). Calculates SVD values (`_compute_svd_modes`) and physically repackages the tensor data to prioritize strong modes/streams. 
+### 🧠 Attention-Guided Physical Allocation (JSCC)
+* **Token Power Allocation (power_alloc)**: Global transmission power is distributed at the semantic token level. Crucial patches identified by the ViT receive higher power amplitudes to resist noisy channel conditions.
+* **Stream/Antenna Assignment (stream_alloc_power)**: Power is allocated considering not only packet importance but also the physical gain (gain_alpha) of the channel, naturally penalizing weaker antennas to maximize efficiency (preventing improper energy exhaustion via max_power_ratio).
+* **SVD Spatial Multiplexing & Mode Pruning**: For channels with strong interference (Rayleigh), Singular Value Decomposition (SVD) is applied to the channel matrix to discover independent paths (modes). Priority tokens are projected directly onto the strongest eigenvectors, while transmissions on weak modes are prudently interrupted (sigma_rel_threshold) to save resources and minimize inverse ^T$ reconstruction errors.
 
-### `comm/comm_module_wrapper.py`
-To seamlessly embed the complex `CommModule` into the existing generic sequential transformer (`methods/proposal.py`), this adapter manages data routing:
-*   **Cross-Layer Score Wiring**: Exposes `_get_selection_scores` which automatically captures the Class Token (`[CLS]`) attention maps from the upstream ViT architecture and funnels them directly into the communications module.
-*   **State Transparency**: Extracts and caches comprehensive physics and allocation statistics into a `last_info` dictionary so that per-batch transmission metadata is accessible to the training loop despite running inside an opaque `nn.Sequential` block.
+---
 
-### `main.py`
-The orchestration/training entry point using the `Hydra` configuration framework.
-*   **Expanded Experiment Epoch Tracking**: Iterates over standard DL steps (loss, backprop), but now actively polls `model.channel.get_last_info()` on every single batch.
-*   **Comprehensive Logging**: Accurately aggregates spatial logic success rates (like `mode_alloc_top_imp_frac` and `symbol_rate`) alongside prediction accuracy, saving detailed joint records inside a newly structured `best_training_results.json` artifact for reproducibility. 
+## 3. Detailed Component Breakdown & Documentation
 
-### `analyze_mimo_scenarios.py`
-A newly created post-experiment diagnostic tool designed to automatically interpret large-scale Hydra hyperparameter grid sweeps.
-*   **Adaptive Configuration Parsing**: Recursively searches output directories, reading `.hydra/overrides.yaml` to dynamically separate *Constant* scenario parameters (e.g., fading type, model size) from *Variable* parameters (e.g., varying SNR levels, antenna counts).
-*   **Hierarchical Grouping**: Assembles disparate JSON iterations into structured folders mapping "Constants $\to$ Array of Variables". It yields clean `comparison_results.json` files specifically formatted for downstream metric plotting.
+To understand the specific upgrades and modifications made to the system, please refer to the detailed markdown documentation located in the Vit_with_MIMO/Documents/ directory:
 
-## 4. Summary
-By bridging these disparate codebases, the user effectively upgraded a static semantic feature-transmission split-learning network into a highly intelligent, physical-layer-aware communication framework. The ViT is now no longer blind to transmission conditions; rather, it uses its learned self-attention understanding of image context to proactively defend critical information using modern MIMO spatial allocation tactics.
+### comm/mimo.py
+Contains the core mathematical operations for the physical layer. The simulation accurately computes fading, injects noise scaled to the target SNR, and applies SVD precoding and MMSE/ZF equalization. 
+* 📖 **Read more:** [MIMO Upgrade Overview](Vit_with_MIMO/Documents/mimo_upgrade.md)
+
+### comm/comm_module.py
+The pivot module for the conversion between the ML model and telecom operations. It exclusively focuses on MIMO channels now, managing token reordering, spatial stream power optimization, and defining spatial efficiency metrics like stream_top_imp_frac.
+* 📖 **Read more:** [Comm Module Upgrade](Vit_with_MIMO/Documents/comm_module_upgrade.md)
+
+### comm/comm_module_wrapper.py
+Acts as a transparent bridge (Adapter) encapsulating the complex physical logic within the ViT's existing 
+n.Sequential blocks. It elegantly routes attention maps (set_score_source) from the ViT encoder to the physical channel.
+* 📖 **Read more:** [Comm Module Wrapper Details](Vit_with_MIMO/Documents/comm_module_wrapper_explain.md)
+
+### methods/proposal.py (The Split-Learning Compressor)
+This module compresses and fragments neural weights prior to transmission. It has been heavily upgraded to hook into survived token attention scores (last_adc_scores) and ensures proper evaluation stability regardless of the model mode.
+* 📖 **Read more:** [Proposal Upgrade](Vit_with_MIMO/Documents/proposal_upgrade.md)
+
+### main.py
+The primary execution controller. It now records extensive telemetry regarding MIMO metrics by periodically fetching model.channel.get_last_info() and robustly handles dynamic multi-SNR sweeps explicitly during the validation_phase.
+* 📖 **Read more:** [Main Optimization Guide](Vit_with_MIMO/Documents/main_upgrade.md)
+
+### Analyze_mimo_scenarios.py
+A heavily redesigned script built to untangle complex organizational hurdles during intensive hyperparameter sweeps. It parses directory trees using pathlib and cleanly structures outputs into a unified JSON formatted layout for downstream visualization.
+* 📖 **Read more:** [Scenario Analysis Explanation](Vit_with_MIMO/Documents/analyze_mimo_scenarios_explain.md)
+
+---
+
+## 4. Configuration Guide
+If you need to tweak hyperparameters, datasets (cifar_100, imagenette, etc.), or alter the simulated radio profiles (such as fading profiles or the equalizer types), please refer to the specific configuration modification guide:
+* 📖 **Configuration Manual:** [How to Modify Configs](Vit_with_MIMO/Documents/how_to_modify_configs.md)
+
+---
+
+## 5. Conclusion
+The convergence of these refactoring upgrades endows this research platform with state-of-the-art neural telecommunications characteristics. Originally isolated, the Split-Learning Vision Transformer now learns to strategically interface with its physical MIMO carrier, intentionally discarding irrelevant dependencies while pushing the most powerful visual representations through the cleanest spatial linkages available at execution time.
