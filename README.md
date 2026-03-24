@@ -23,38 +23,42 @@ The core of this integration relies on **Joint Source-Channel Coding (JSCC)** op
 
 ## 3. Detailed Component Breakdown & Documentation
 
-To understand the specific upgrades and modifications made to the system, please refer to the detailed markdown documentation located in the ViT_with_MIMO/Documents/ directory:
+To understand the specific upgrades and modifications made to the system, please refer to the detailed markdown documentation located in the Vit_with_MIMO/Documents/ directory:
 
 ### comm/mimo.py
 Contains the core mathematical operations for the physical layer. The simulation accurately computes fading, injects noise scaled to the target SNR, and applies SVD precoding and MMSE/ZF equalization. 
-* 📖 **Read more:** [MIMO Upgrade Overview](ViT_with_MIMO/Documents/mimo_upgrade.md)
+* 📖 **Read more:** [MIMO Upgrade Overview](Vit_with_MIMO/Documents/mimo_upgrade.md)
 
 ### comm/comm_module.py
 The pivot module for the conversion between the ML model and telecom operations. It exclusively focuses on MIMO channels now, managing token reordering, spatial stream power optimization, and defining spatial efficiency metrics like stream_top_imp_frac.
-* 📖 **Read more:** [Comm Module Upgrade](ViT_with_MIMO/Documents/comm_module_upgrade.md)
+* 📖 **Read more:** [Comm Module Upgrade](Vit_with_MIMO/Documents/comm_module_upgrade.md)
 
 ### comm/comm_module_wrapper.py
 Acts as a transparent bridge (Adapter) encapsulating the complex physical logic within the ViT's existing 
 n.Sequential blocks. It elegantly routes attention maps (set_score_source) from the ViT encoder to the physical channel.
-* 📖 **Read more:** [Comm Module Wrapper Details](ViT_with_MIMO/Documents/comm_module_wrapper_explain.md)
+* 📖 **Read more:** [Comm Module Wrapper Details](Vit_with_MIMO/Documents/comm_module_wrapper_explain.md)
 
 ### methods/proposal.py (The Split-Learning Compressor)
 This module compresses and fragments neural weights prior to transmission. It has been heavily upgraded to hook into survived token attention scores (last_adc_scores) and ensures proper evaluation stability regardless of the model mode.
-* 📖 **Read more:** [Proposal Upgrade](ViT_with_MIMO/Documents/proposal_upgrade.md)
+* 📖 **Read more:** [Proposal Upgrade](Vit_with_MIMO/Documents/proposal_upgrade.md)
 
 ### main.py
 The primary execution controller. It now records extensive telemetry regarding MIMO metrics by periodically fetching model.channel.get_last_info() and robustly handles dynamic multi-SNR sweeps explicitly during the validation_phase.
-* 📖 **Read more:** [Main Optimization Guide](ViT_with_MIMO/Documents/main_upgrade.md)
+* 📖 **Read more:** [Main Optimization Guide](Vit_with_MIMO/Documents/main_upgrade.md)
 
 ### Analyze_mimo_scenarios.py
 A heavily redesigned script built to untangle complex organizational hurdles during intensive hyperparameter sweeps. It parses directory trees using pathlib and cleanly structures outputs into a unified JSON formatted layout for downstream visualization.
-* 📖 **Read more:** [Scenario Analysis Explanation](ViT_with_MIMO/Documents/analyze_mimo_scenarios_explain.md)
+* 📖 **Read more:** [Scenario Analysis Explanation](Vit_with_MIMO/Documents/analyze_mimo_scenarios_explain.md)
+
+### Documents/test_description.md
+Provides a detailed description of the ongoing experimental test, including model architecture, split-computing configuration, and communication channel profiles.
+* 📖 **Read more:** [Current Test Description](Vit_with_MIMO/Documents/test_description.md)
 
 ---
 
 ## 4. Configuration Guide
 If you need to tweak hyperparameters, datasets (cifar_100, imagenette, etc.), or alter the simulated radio profiles (such as fading profiles or the equalizer types), please refer to the specific configuration modification guide:
-* 📖 **Configuration Manual:** [How to Modify Configs](ViT_with_MIMO/Documents/how_to_modify_configs.md)
+* 📖 **Configuration Manual:** [How to Modify Configs](Vit_with_MIMO/Documents/how_to_modify_configs.md)
 
 ---
 

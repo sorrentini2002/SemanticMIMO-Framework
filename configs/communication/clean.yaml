@@ -1,0 +1,18 @@
+# Clean configuration with Bottleneck enabled.
+# Channel radio is disabled, so we only test the effect of the bottleneck compression.
+name: clean
+
+channel:
+  _target_: comm.comm_module_wrapper.CommModuleWrapper
+  input_dim: 192
+  config:
+    comm: ${communication.comm}
+
+comm:
+  enabled: true
+  bottleneck:
+    enabled: false            
+    out_dim: 128              
+  channel:
+    enabled: false    
+    snr_db: 20

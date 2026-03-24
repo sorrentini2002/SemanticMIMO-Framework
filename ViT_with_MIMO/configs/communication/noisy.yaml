@@ -1,4 +1,0 @@
-channel:
-  _target_:  comm.communication.Gaussian_Noise_Analogic_Channel
-  snr_range: 10
-name: noisy

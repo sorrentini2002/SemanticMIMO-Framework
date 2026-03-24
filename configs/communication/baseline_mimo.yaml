@@ -1,7 +1,7 @@
 # Hard CIFAR baseline with MIMO AWGN channel.
 name: "baseline_mimo"
 eval:
-  snr_sweep: [0, 10, 20]
+  snr_sweep: [-5, 0, 10, 20]
 
 channel:
   _target_: comm.comm_module_wrapper.CommModuleWrapper
@@ -27,7 +27,7 @@ comm:
     normalize: true
     normalization_mode: "sample"
     power_alloc:
-      enabled: false
+      enabled: true
       source: "selection_scores"  # selection_scores | uniform | attention_cls
       alpha: 1.0
       eps: 1.0e-4

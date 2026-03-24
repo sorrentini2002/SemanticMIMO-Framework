@@ -1,0 +1,29 @@
+# Noisy configuration: Bottleneck + AWGN Channel.
+# This simulates a scenario with compression artifacts AND transmission noise.
+name: noisy
+
+eval:
+  snr_sweep: [-5, 0, 10, 20]
+
+channel:
+  _target_: comm.comm_module_wrapper.CommModuleWrapper
+  input_dim: 192
+  config:
+    comm: ${communication.comm}
+
+comm:
+  enabled: true
+  bottleneck:
+    enabled: true             
+    out_dim: 128              
+  channel:
+    enabled: true             
+    type: "mimo"              
+    n_tx: 1
+    n_rx: 1
+    fading: "identity"
+    snr_db: [0, 20]           
+    train_mode: "sampled"     
+    sample_mode: "per_sample" 
+    normalize: true
+    normalization_mode: "sample"

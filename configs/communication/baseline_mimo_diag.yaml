@@ -1,7 +1,7 @@
-# Hard CIFAR baseline with Rayleigh MIMO channel and SVD mode allocation.
-name: baseline_mimo_svd
+# Hard CIFAR baseline with diagonal MIMO channel and importance-aware stream allocation.
+name: baseline_mimo_diag
 eval:
-  snr_sweep: [0, 10, 20]
+  snr_sweep: [-5, 0, 5, 10, 20]
 
 channel:
   _target_: comm.comm_module_wrapper.CommModuleWrapper
@@ -20,29 +20,34 @@ comm:
     type: "mimo"
     n_tx: 4
     n_rx: 4
-    fading: "rayleigh"
+    fading: "diagonal"
     equalizer: "mmse"
-    snr_db: [0, 20]
-    train_mode: "sampled"
     sample_mode: "per_sample"
-    normalize: true
-    normalization_mode: "sample"
-    mode_alloc:
+    diagonal:
+      gains: [1.0, 0.8, 0.5, 0.3]
+      random:
+        enabled: false
+        distribution: "uniform"
+        min_gain: 0.2
+        max_gain: 1.0
+        seed: 0
+    stream_alloc:
       enabled: true
-      svd:
-        per_sample: true
+      strategy: "importance_to_gain"
       assignment:
         enabled: true
         granularity: "token"
         chunk_size: 1
-        prioritize_cls: true
       power:
         enabled: true
         alpha: 1.0
         eps: 1.0e-4
-      num_modes: null
+    snr_db: [0, 20]
+    train_mode: "sampled"
+    normalize: true
+    normalization_mode: "sample"
     power_alloc:
-      enabled: false
+      enabled: true
       source: "selection_scores"
       alpha: 1.0
       eps: 1.0e-4

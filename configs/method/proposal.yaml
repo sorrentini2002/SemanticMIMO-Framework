@@ -6,7 +6,7 @@ model:
   pooling: ${..parameters.pooling}
 name: proposal
 parameters:
-  desired_compression: null
+  desired_compression: 0.1
   token_compression: null
   batch_compression: null
   pooling: attention
