@@ -17,7 +17,7 @@ The core of this integration relies on **Joint Source-Channel Coding (JSCC)** op
 ### 🧠 Attention-Guided Physical Allocation (JSCC)
 * **Token Power Allocation (power_alloc)**: Global transmission power is distributed at the semantic token level. Crucial patches identified by the ViT receive higher power amplitudes to resist noisy channel conditions.
 * **Stream/Antenna Assignment (stream_alloc_power)**: Power is allocated considering not only packet importance but also the physical gain (gain_alpha) of the channel, naturally penalizing weaker antennas to maximize efficiency (preventing improper energy exhaustion via max_power_ratio).
-* **SVD Spatial Multiplexing & Mode Pruning**: For channels with strong interference (Rayleigh), Singular Value Decomposition (SVD) is applied to the channel matrix to discover independent paths (modes). Priority tokens are projected directly onto the strongest eigenvectors, while transmissions on weak modes are prudently interrupted (sigma_rel_threshold) to save resources and minimize inverse ^T$ reconstruction errors.
+* **SVD Spatial Multiplexing & Mode Pruning**: For channels with strong interference (Rayleigh), Singular Value Decomposition (SVD) is applied to the channel matrix to discover independent paths (modes). Priority tokens are projected directly onto the strongest eigenvectors, while transmissions on weak modes are prudently interrupted (sigma_rel_threshold) to save resources and minimize inverse reconstruction errors.
 
 ---
 
