@@ -4,7 +4,7 @@ This document provides a detailed description of the experimental test configura
 
 ## 1. Plots
 
-![Best Validation Accuracy Heatmap](../Plots/plt1.png)
+![Best Validation Accuracy Heatmap](../images/plt1.png)
 
 ### 1.1. Best Validation Accuracy Heatmap
 This subsection displays a heatmap summarizing the `best_val_accuracy` obtained for different communication channels (`noisy`, `baseline_mimo_diag`, `baseline_mimo_svd`) across various Signal-to-Noise Ratio (**SNR**) levels.
@@ -12,7 +12,7 @@ This subsection displays a heatmap summarizing the `best_val_accuracy` obtained 
 - **Objective**: Compare the robustness of different transmission strategies under various noise conditions.
 - **Baseline**: The accuracy on the `clean` channel serves as the upper-bound reference for ideal, error-free transmission.
 
-![Validation Accuracy Evolution per Epoch](../Plots/plt2.png)
+![Validation Accuracy Evolution per Epoch](../images/plt2.png)
 
 
 
@@ -23,7 +23,7 @@ This set of plots visualizes the progression of validation accuracy over trainin
 - **Baseline Comparison**: The `clean` baseline (gray line) is overlaid on each subplot to demonstrate the performance gap between ideal conditions and various noisy scenarios.
 - **Purpose**: This visualization tracks the convergence of the model and compares the efficiency of the different transmission strategies across the entire training duration.
 
-![Measured Post-Equalization SNR Heatmap](../Plots/plt3.png)
+![Measured Post-Equalization SNR Heatmap](../images/plt3.png)
 
 ### 1.3. Measured Post-Equalization SNR Heatmap
 This heatmap examines the difference between the experimental **Target SNR** and the **Effective SNR** measured after the signal recovery phase at the receiver.
