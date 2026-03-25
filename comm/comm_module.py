@@ -1,4 +1,5 @@
 import logging
+from collections.abc import Mapping
 
 import torch
 import torch.nn as nn
@@ -7,6 +8,22 @@ from .bottleneck import Bottleneck
 from .mimo import MIMOAWGNChannel, pack_tokens_to_mimo_symbols, unpack_mimo_symbols_to_tokens
 
 logger = logging.getLogger(__name__)
+
+
+def _to_plain_dict(cfg):
+    """Recursively convert Hydra DictConfig / ListConfig to plain Python
+    dicts and lists so that isinstance(x, dict) checks always work."""
+    try:
+        from omegaconf import DictConfig, ListConfig, OmegaConf
+        if isinstance(cfg, (DictConfig, ListConfig)):
+            return OmegaConf.to_container(cfg, resolve=True)
+    except ImportError:
+        pass
+    if isinstance(cfg, Mapping):
+        return {k: _to_plain_dict(v) for k, v in cfg.items()}
+    if isinstance(cfg, (list, tuple)):
+        return type(cfg)(_to_plain_dict(v) for v in cfg)
+    return cfg
 
 class CommModule(nn.Module):
     """
@@ -39,7 +56,7 @@ class CommModule(nn.Module):
         bn_out_dim = bn_cfg.get("out_dim", input_dim)
         
         # Channel
-        ch_cfg = comm_cfg.get("channel", {})
+        ch_cfg = _to_plain_dict(comm_cfg.get("channel", {}))
         self.channel_cfg = copy.deepcopy(ch_cfg)
         self.use_channel = ch_cfg.get("enabled", False)
         self.channel_type = ch_cfg.get("type", "mimo")
@@ -62,6 +79,7 @@ class CommModule(nn.Module):
         self.bn_out_dim = bn_out_dim
         
     def _build_channel(self, ch_cfg):
+        ch_cfg = _to_plain_dict(ch_cfg)
         self.channel_cfg = copy.deepcopy(ch_cfg)
         ch_type = ch_cfg.get("type", "mimo")
         self.channel_type = ch_type
@@ -244,19 +262,26 @@ class CommModule(nn.Module):
         packed_default, pack_stats = pack_tokens_to_mimo_symbols(tx_signal, n_tx=self.channel.n_tx)
         cfg = self.stream_alloc_cfg or {}
         enabled = bool(cfg.get("enabled", False))
-        strategy = str(cfg.get("strategy", "importance_to_gain"))
-        assignment_cfg = cfg.get("assignment", {}) or {}
-        stream_power_cfg = cfg.get("power", {}) or {}
-        assignment_cfg_enabled = bool(assignment_cfg.get("enabled", True))
-        stream_power_cfg_enabled = bool(stream_power_cfg.get("enabled", False))
-        assignment_enabled = enabled and assignment_cfg_enabled
-        stream_power_enabled = enabled and stream_power_cfg_enabled
+
+        # Inizializziamo i default sicuri per i log (tutto spento)
+        strategy = "none"
+        assignment_enabled = False
+        stream_power_enabled = False
+
+        if enabled:
+            # Leggiamo le sub-configurazioni SOLO se il modulo principale è attivo
+            strategy = str(cfg.get("strategy", "importance_to_gain"))
+            assignment_cfg = cfg.get("assignment", {}) or {}
+            stream_power_cfg = cfg.get("power", {}) or {}
+            
+            assignment_enabled = bool(assignment_cfg.get("enabled", True))
+            stream_power_enabled = bool(stream_power_cfg.get("enabled", False))
 
         alloc_stats = {
-            "stream_alloc_enabled": enabled,
+            "stream_alloc_enabled": float(enabled),
             "stream_alloc_strategy": strategy,
-            "stream_alloc_assignment_enabled": assignment_enabled,
-            "stream_alloc_power_enabled": stream_power_enabled,
+            "stream_alloc_assignment_enabled": float(assignment_enabled),
+            "stream_alloc_power_enabled": float(stream_power_enabled),
         }
         if not enabled:
             return packed_default, pack_stats, None, alloc_stats, None
@@ -792,30 +817,37 @@ class CommModule(nn.Module):
     def reconfigure(self, config_snippet):
         """
         Reconfigures the communication module (specifically the channel) in-place.
-        Useful for evaluation overrides.
-        
+        Only supports SNR-only overrides (eval-time SNR sweep).
+
         Args:
-            config_snippet: dict part of 'comm' config (e.g. {'channel': {...}})
+            config_snippet: dict part of 'comm' config (e.g. {'channel': {'snr_db': 10}})
+
+        Raises:
+            ValueError: if the override contains keys other than 'snr_db'.
         """
-        if 'channel' in config_snippet:
-            merged_cfg = copy.deepcopy(self.channel_cfg) if isinstance(self.channel_cfg, dict) else {}
-            override_cfg = config_snippet['channel']
+        if 'channel' not in config_snippet:
+            return
 
-            def _merge_dict(dst, src):
-                for k, v in src.items():
-                    if isinstance(v, dict) and isinstance(dst.get(k), dict):
-                        _merge_dict(dst[k], v)
-                    else:
-                        dst[k] = v
+        override_cfg = _to_plain_dict(config_snippet['channel'])
+        if not isinstance(override_cfg, dict):
+            raise TypeError(
+                f"reconfigure: expected dict for channel override, got {type(override_cfg).__name__}"
+            )
 
-            if isinstance(override_cfg, dict):
-                _merge_dict(merged_cfg, override_cfg)
+        non_snr_keys = set(override_cfg.keys()) - {'snr_db'}
+        if non_snr_keys:
+            raise ValueError(
+                f"reconfigure: only 'snr_db' overrides are supported, "
+                f"got unexpected keys: {non_snr_keys}"
+            )
 
-            self.use_channel = merged_cfg.get('enabled', self.use_channel)
-            if self.use_channel:
-                self._build_channel(merged_cfg)
-            else:
-                self.channel = None
+        if self.channel is None:
+            raise RuntimeError("reconfigure: channel is None, cannot update snr_db")
+
+        if 'snr_db' in override_cfg:
+            self.channel.snr_db = override_cfg['snr_db']
+            if isinstance(self.channel_cfg, dict):
+                self.channel_cfg['snr_db'] = override_cfg['snr_db']
             
     def forward(self, x, selection_indices=None, selection_scores=None, generator=None):
         """

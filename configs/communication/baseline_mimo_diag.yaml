@@ -1,7 +1,7 @@
 # Hard CIFAR baseline with diagonal MIMO channel and importance-aware stream allocation.
 name: baseline_mimo_diag
 eval:
-  snr_sweep: [-5, 0, 5, 10, 20]
+  snr_sweep: [-5, 0, 10, 20]
 
 channel:
   _target_: comm.comm_module_wrapper.CommModuleWrapper
