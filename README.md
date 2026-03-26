@@ -17,7 +17,7 @@ The core of this integration relies on **Joint Source-Channel Coding (JSCC)** op
 ### 🧠 Attention-Guided Physical Allocation (JSCC)
 * **Token Power Allocation (power_alloc)**: Global transmission power is distributed at the semantic token level. Crucial patches identified by the ViT receive higher power amplitudes to resist noisy channel conditions.
 * **Stream/Antenna Assignment (stream_alloc_power)**: Power is allocated considering not only packet importance but also the physical gain (gain_alpha) of the channel, naturally penalizing weaker antennas to maximize efficiency (preventing improper energy exhaustion via max_power_ratio).
-* **SVD Spatial Multiplexing & Mode Pruning**: For channels with strong interference (Rayleigh), Singular Value Decomposition (SVD) is applied to the channel matrix to discover independent paths (modes). Priority tokens are projected directly onto the strongest eigenvectors, while transmissions on weak modes are prudently interrupted (sigma_rel_threshold) to save resources and minimize inverse reconstruction errors.
+* **SVD Spatial Multiplexing & Mode Pruning**: For channels with strong interference (Rayleigh), Singular Value Decomposition (SVD) is applied to the channel matrix to discover independent paths (modes). Priority tokens are projected directly onto the strongest eigenvectors, while transmissions on weak modes are prudently interrupted (sigma_rel_threshold) to save resources and minimize inverse ^T$ reconstruction errors.
 
 ---
 
@@ -50,10 +50,6 @@ The primary execution controller. It now records extensive telemetry regarding M
 A heavily redesigned script built to untangle complex organizational hurdles during intensive hyperparameter sweeps. It parses directory trees using pathlib and cleanly structures outputs into a unified JSON formatted layout for downstream visualization.
 * 📖 **Read more:** [Scenario Analysis Explanation](Documents/analyze_mimo_scenarios_explain.md)
 
-### Documents/test_description.md
-Provides a detailed description of the ongoing experimental test, including model architecture, split-computing configuration, and communication channel profiles.
-* 📖 **Read more:** [Current Test Description](Documents/test_description.md)
-
 ---
 
 ## 4. Configuration Guide
@@ -62,5 +58,17 @@ If you need to tweak hyperparameters, datasets (cifar_100, imagenette, etc.), or
 
 ---
 
-## 5. Conclusion
+## 5. Experimental Tests
+
+### Documents/test_description.md
+Provides a detailed description of the ongoing experimental test, including model architecture, split-computing configuration, and communication channel profiles.
+* 📖 **Read more:** [Current Test Description](Documents/test_description.md)
+
+### Documents/result_description.md
+Provides a detailed description of the results of the ongoing experimental test, including a set of plots that summarize the results.
+* 📖 **Read more:** [Current Test Description](Documents/result_description.md)
+
+---
+
+## 6. Conclusion
 The convergence of these refactoring upgrades endows this research platform with state-of-the-art neural telecommunications characteristics. Originally isolated, the Split-Learning Vision Transformer now learns to strategically interface with its physical MIMO carrier, intentionally discarding irrelevant dependencies while pushing the most powerful visual representations through the cleanest spatial linkages available at execution time.

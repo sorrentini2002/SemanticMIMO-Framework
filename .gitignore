@@ -1,6 +1,6 @@
 data
-plots
-old_results
-old_plots
+results
+plots_old
+/plots_backup
 plot_scripts
 /__pycache__
