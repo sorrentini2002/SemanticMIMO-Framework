@@ -48,3 +48,35 @@ Test without using the Bottleneck tool.
 ### 2.3. Measured Post-Equalization SNR Heatmap
 
 ![Measured Post-Equalization SNR Heatmap](../Plots/scenario_2/plt3.png)
+
+# Testing SVD Parameters
+
+Testing with different SVD parameters. Specifically, the following configurations were tested exclusively (one at a time):
+- **Normalized mode**: Applied on the batch rather than on individual samples.
+- **Internal Semantic Waterfilling**: Applied only within the SVD channel and not across tokens, by setting `power_alloc` to `false`.
+- **Alpha parameter**: Using `alpha = 0.7 and 0.5` instead of `1.0` within the internal SVD semantic waterfilling.
+- **Chunk size**: Using a chunk size of 4 instead of 1.
+
+For Plot 3.2, the reference value is the average validation accuracy across different noise configurations for the SVD case with the bottleneck deactivated. This comparison aims to determine if the SVD parameter modifications yield performance improvements over the base case.
+
+## 3. Plots
+
+### 3.1. Best Validation Accuracy Heatmap
+
+![Best Validation Accuracy Heatmap](../Plots/testing_svd/plt1.png)
+
+### 3.2. Validation Accuracy Evolution per Epoch
+
+![Validation Accuracy Evolution per Epoch](../Plots/testing_svd/plt2.png)
+
+### 3.3. Measured Post-Equalization SNR Heatmap
+
+![Measured Post-Equalization SNR Heatmap](../Plots/testing_svd/plt3.png)
+
+# Comparison between Baseline with Channel/ADC Active vs. Without
+
+## 4. Plots
+
+### 4.1. Validation Accuracy Evolution per Epoch
+
+![Validation Accuracy Evolution per Epoch](../Plots/comparison_clean/plt1.png)

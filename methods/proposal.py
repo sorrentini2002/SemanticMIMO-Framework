@@ -125,10 +125,10 @@ class Compress_Batches_and_Select_Tokens_Block_Wrapper(nn.Module):
         # Normal block forward 
         x = x + self.block.drop_path1(self.block.ls1(self.block.attn(self.block.norm1(x))))
         x = x + self.block.drop_path2(self.block.ls2(self.block.mlp(self.block.norm2(x))))
-
-        # Apply ADC in both train and eval so communication/compression
-        # statistics are consistent across phases.
-        x = self.merge_batches_and_select_tokens(x)
+        if self.training:
+            # Apply ADC in train to have consistent communication/compression
+            # statistics across training.
+            x = self.merge_batches_and_select_tokens(x)
 
         return x
 

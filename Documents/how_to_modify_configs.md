@@ -24,6 +24,7 @@ Regulates the end-to-end transmission from the Client to the Server, handling co
 
 ### General Configuration and Evaluation
 *   **`eval/snr_sweep`**: Indicates the SNR values (dB) tested during the evaluation phase. An analysis is performed for each parameter in the list. If omitted, the maximum value defined in `snr_db` is used.
+*   **`eval/clean_validation`**: Boolean flag. If `true`, the model bypasses ADC compression and the communication channel during evaluation, performing a "clean" inference. Default is `false` (noisy validation).
 *   **`channel/input_dim`**: Defines the dimension of the last client-side layer before passing to the communication channel (e.g. 192 for tiny architectures).
 *   **`bottleneck/out_dim`**: Indicates the format in which images are sent to the channel. A compression layer (Joint Source-Channel Coding) is applied to reduce the size of the original data.
 
