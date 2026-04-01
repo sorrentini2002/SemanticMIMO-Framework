@@ -337,16 +337,26 @@ class MIMOAWGNChannel(nn.Module):
                     continue
             raise
 
-    def _equalize(self, h: torch.Tensor, y: torch.Tensor, sigma2_vec: torch.Tensor) -> torch.Tensor:
+    def _equalize(self, h: torch.Tensor, y: torch.Tensor, sigma2_vec: torch.Tensor,
+                  stream_power_weights: Optional[torch.Tensor] = None) -> torch.Tensor:
         if self.equalizer == "zf":
             h_pinv = torch.linalg.pinv(h)
             return torch.matmul(h_pinv, y)
 
-        # MMSE: (H^T H + (sigma^2 + eps) I)^-1 H^T Y
+        # MMSE: (H^T H + σ² W^{-1})^{-1} H^T Y
+        # When W is None (uniform power), W^{-1} = I → standard MMSE.
         ht = h.transpose(1, 2)
         hth = torch.matmul(ht, h).to(dtype=h.dtype)
         i_eye = torch.eye(self.n_tx, device=h.device, dtype=h.dtype).unsqueeze(0).expand(h.shape[0], -1, -1)
-        a = hth + (sigma2_vec.view(-1, 1, 1) + self.mmse_eps) * i_eye
+
+        if stream_power_weights is not None:
+            # W = diag(stream_power_weights) → W^{-1} = diag(1/w_i)
+            w_inv = 1.0 / stream_power_weights.clamp_min(1e-9)  # [B, n_tx]
+            reg_matrix = torch.diag_embed(w_inv)  # [B, n_tx, n_tx]
+        else:
+            reg_matrix = i_eye
+
+        a = hth + (sigma2_vec.view(-1, 1, 1) + self.mmse_eps) * reg_matrix
         rhs = torch.matmul(ht, y).to(dtype=a.dtype)
         if self._mmse_use_inverse_path(h):
             return self._mmse_inverse_with_jitter(a, rhs, i_eye)
@@ -410,7 +420,10 @@ class MIMOAWGNChannel(nn.Module):
         noise = noise * torch.sqrt(sigma2_vec.view(-1, 1, 1))
         y = y_signal + noise
 
-        s_hat = self._equalize(h, y, sigma2_vec)
+        s_hat = self._equalize(
+            h, y, sigma2_vec,
+            stream_power_weights=kwargs.get("stream_power_weights", None),
+        )
 
         with torch.no_grad():
             p_sig_pre = torch.mean(y_signal ** 2)

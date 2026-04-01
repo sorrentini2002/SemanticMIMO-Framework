@@ -179,6 +179,51 @@ if self.fading == "diagonal":
 
 ---
 
+## 7. Method `_equalize` — MMSE covariance correction with per-stream power weights
+
+### Problem
+
+The MMSE equaliser assumed that the transmitted symbols have uniform (white) covariance, using the regularisation term $\sigma^2 I$:
+
+$$\hat{S} = (H^T H + \sigma^2 I)^{-1} H^T Y$$
+
+However, when `stream_alloc.power` is enabled, the transmitter applies per-antenna power scaling $W = \text{diag}(w_1, \dots, w_{n_{tx}})$, producing non-uniform transmit covariance. Under this condition the optimal MMSE filter requires:
+
+$$\hat{S} = (H^T H + \sigma^2 W^{-1})^{-1} H^T Y$$
+
+### Previous version
+```python
+def _equalize(self, h, y, sigma2_vec):
+    # ...
+    a = hth + (sigma2_vec.view(-1, 1, 1) + self.mmse_eps) * i_eye
+```
+
+### Updated version
+```python
+def _equalize(self, h, y, sigma2_vec, stream_power_weights=None):
+    # ...
+    if stream_power_weights is not None:
+        # W = diag(stream_power_weights) → W^{-1} = diag(1/w_i)
+        w_inv = 1.0 / stream_power_weights.clamp_min(1e-9)  # [B, n_tx]
+        reg_matrix = torch.diag_embed(w_inv)                 # [B, n_tx, n_tx]
+    else:
+        reg_matrix = i_eye
+
+    a = hth + (sigma2_vec.view(-1, 1, 1) + self.mmse_eps) * reg_matrix
+```
+
+**What changed:**
+- `_equalize` accepts an optional `stream_power_weights` parameter of shape `[B, n_tx]`
+- When provided, the regularisation matrix becomes $W^{-1} = \text{diag}(1/w_i)$ instead of $I$
+- When `None` (default), behaviour is identical to the previous version (standard MMSE)
+- The `forward` method passes `stream_power_weights` from `kwargs` to `_equalize`
+
+### Mathematical rationale
+
+In the standard MMSE derivation, the estimator minimises $E[\|S - \hat{S}\|^2]$ assuming $\text{Cov}(S) = I$. When the transmitter scales stream $i$ by $\sqrt{w_i}$, the actual covariance is $\text{Cov}(S) = W$. Substituting into the Wiener filter formula yields the corrected regularisation $\sigma^2 W^{-1}$.
+
+---
+
 ## Summary of changes
 
 | Area | Type of change |
@@ -188,6 +233,8 @@ if self.fading == "diagonal":
 | `_get_diagonal_random_cfg` | **New method** — centralizes safe reading of `diagonal.random` |
 | `_validate_diagonal_config` | Replaced inline reading with `_get_diagonal_random_cfg()` |
 | `sample_diagonal_gains` | Replaced inline reading with `_get_diagonal_random_cfg()` |
-| `forward` | Replaced inline reading with `_get_diagonal_random_cfg()` |
+| `forward` | Replaced inline reading with `_get_diagonal_random_cfg()`; passes `stream_power_weights` to `_equalize` |
+| `_equalize` | **MMSE fix** — accepts optional `stream_power_weights` $W$; uses $(H^T H + \sigma^2 W^{-1})^{-1}$ |
 
-The changes are overall of **refactoring and compatibility** nature: they do not alter the functional behavior of the channel for already correct configurations, but improve robustness with respect to OmegaConf/Hydra configurations and remove duplication of diagonal config access logic.
+The previous changes are of **refactoring and compatibility** nature. The new `_equalize` change is a **correctness fix** that aligns the MMSE filter with the actual transmit covariance when per-stream power allocation is active.
+

@@ -433,40 +433,100 @@ Generates tracking metrics automatically thoroughly fully completely natively na
 
 ---
 
-## 10. `_unpack_mode_alloc` Method — Complete rewrite correctly projecting arrays cleanly properly carefully V inverse matrices structurally fundamentally clearly cleanly smoothly natively effectively precisely properly carefully comprehensively perfectly accurately
+## 10. Semantic Garbling Fix — `_apply_mode_alloc` reordering domain change
 
-### Original version
-```python
-def _unpack_mode_alloc(self, rx_packed, mode_alloc_ctx, tx_signal_shape, pack_stats):
-    # Missing V^T conversions completely
-    flat = rx_packed.reshape(bsz, -1)
-    rx_ordered = flat.gather(1, positions)
-    restore_order = torch.argsort(src_order, dim=1)
-    restored = rx_ordered.gather(1, restore_order)
-    return restored.reshape(bsz, n_tokens, d_sent)
+### Problem: irreversible token mixing
+
+The previous implementation performed the SVD projection ($V^T \cdot \text{packed}$) **before** the importance-based gather. This meant the reordering operated in the **mode domain**, where each mode is a linear combination of all antennas. Gathering in mode domain irreversibly mixes spatial token information across antennas, destroying the Transformer's attention structure ("semantic garbling").
+
+### Previous pipeline (buggy)
+```
+packed [B, n_tx, T]
+  → V^T @ packed → s_mode [B, K, T]   ← spatial mixing happens HERE
+  → gather(s_mode, src_order)          ← too late, tokens are already mixed
+  → scatter into mode grid
+  → V @ s_mode → s_out [B, n_tx, T]
 ```
 
-**Problem:** Missed fundamental mathematical rules routing structures directly extracting values without converting dimensions safely exactly successfully cleanly preventing mathematical accuracy cleanly correctly.
+### Fixed pipeline
+```
+packed [B, n_tx, T]
+  → gather(packed, src_order)          ← reorder in ANTENNA domain (tokens intact)
+  → scatter into antenna grid
+  → V^T @ packed_reordered → s_mode   ← project AFTER ordering
+  → V @ s_mode → s_out [B, n_tx, T]
+```
+
+### Key code change
+```python
+# BEFORE (mode domain — WRONG):
+flat_mode = s_mode.reshape(bsz, -1)          # mode domain
+ordered_flat = flat_mode.gather(1, src_order_trunc)
+
+# AFTER (antenna domain — CORRECT):
+flat_antenna = packed.reshape(bsz, -1)       # antenna domain
+ordered_flat = flat_antenna.gather(1, src_order_trunc)
+```
+
+**What changed:** The gather now operates on `packed` (antenna domain) rather than `s_mode` (mode domain). The SVD projection `V^T @ packed` is applied only after the positional reordering is complete. This preserves per-token spatial identity: each token's feature vector remains coherent and is never mixed with other tokens' data before being assigned to a strong SVD mode.
+
+### Capacity bound
+The `l_assign` truncation now uses `n_tx * t` instead of `k * t` since the gather operates in antenna-domain space (full `n_tx` rows), not the potentially reduced `k`-mode space.
+
+### Power allocation adjustment
+When `mode_alloc.power.enabled = True`, per-mode importance weights are now computed by:
+1. Aggregating per-token scores in antenna domain (via positions scatter)
+2. Projecting antenna importance to mode importance via $|V^T| \cdot w_\text{antenna}$
+
+This replaces the previous direct scatter into mode-domain grids that was conceptually inconsistent.
+
+---
+
+## 11. `_unpack_mode_alloc` — Simplified to antenna-domain ungather
+
+### Previous version
+Required a `V^T` projection on the received signal to convert from antenna domain to mode domain before un-scattering, because the TX gather operated in mode domain:
+```python
+# Step 1: V^T @ rx_packed → s_mode_rx  (project to mode domain)
+# Step 2: gather(s_mode_rx, positions)   (un-scatter in mode domain)
+# Step 3: scatter(src_order, ...)        (restore token order)
+```
 
 ### Updated version
+Since the TX gather now operates in antenna domain, the receiver un-scatter also operates directly in antenna domain — **no V^T projection needed**:
 ```python
 def _unpack_mode_alloc(self, rx_packed, mode_alloc_ctx, tx_signal_shape, pack_stats):
-    v_mat = mode_alloc_ctx["v_mat"]  # [B, n_tx, K]
-    k     = mode_alloc_ctx["k"]
+    # Step 1 — Flatten equalised antenna-domain signal and un-scatter
+    flat_rx = rx_packed.reshape(bsz, -1)         # [B, n_tx*T]
+    rx_ordered = flat_rx.gather(1, positions)     # [B, l_assign]
 
-    # Step 1 — Projection towards modes domain clearly beautifully safely efficiently exactly: s_mode_rx = V^T @ rx_packed
-    vt = v_mat.transpose(-2, -1)               # [B, K, n_tx]
-    s_mode_rx = torch.matmul(vt, rx_packed)    # [B, K, T]
-
-    # Step 2/3 — Un-scatter reverting order sequences smoothly efficiently cleanly safely carefully directly structurally fully effectively optimally naturally fully dynamically completely smoothly exactly correctly flawlessly structurally intelligently properly safely accurately cleanly securely fundamentally functionally correctly perfectly successfully
-    flat_mode_rx  = s_mode_rx.reshape(bsz, -1)
-    rx_ordered    = flat_mode_rx.gather(1, positions)
+    # Step 2 — Restore original token order
     restored_flat = rx_ordered.new_zeros((bsz, l))
-    if l_assign > 0 and positions.shape[1] > 0:
-        restored_flat.scatter_(1, src_order, rx_ordered)
+    restored_flat.scatter_(1, src_order, rx_ordered)
 
-    # Step 4 — Reshape correctly correctly cleanly correctly successfully accurately seamlessly safely naturally effectively successfully flawlessly cleanly successfully intelligently smoothly functionally
+    # Step 3 — Reshape to token domain [B, N, D]
     return restored_flat.reshape(bsz, n_tokens, d_sent)
 ```
 
-**What changed:** Restores full mathematical properties translating grids accurately processing inversions carefully executing extraction parameters cleanly properly naturally safely functionally correctly accurately completely seamlessly restoring original structural properties cleanly preventing missing attributes safely seamlessly successfully safely efficiently restoring missing blocks properly functionally correctly smoothly flawlessly directly intelligently safely precisely exactly comprehensively structurally thoroughly effectively naturally effectively.
+**What changed:** The `V^T` projection step was removed entirely from the unpack path. The equaliser delivers the received signal in antenna domain, which is exactly the domain where the gather was performed at the transmitter, so no domain conversion is necessary. This makes the unpack simpler, faster, and mathematically coherent with the new TX pipeline.
+
+---
+
+## 12. Stream power weights propagation to MMSE equaliser
+
+### Problem
+The `stream_alloc.power` feature applies per-antenna power scaling at the transmitter, producing a non-uniform transmit covariance. However, the MMSE equaliser in `mimo.py` assumed white (uniform) transmit covariance ($I$), leading to a mismatched estimation filter.
+
+### Solution
+The `forward` method now reconstructs the per-stream power weights vector $W$ from the stream allocation configuration and passes it to the MIMO channel via the `stream_power_weights` keyword argument. This allows the MMSE filter to use the correct regularisation: $(H^T H + \sigma^2 W^{-1})^{-1}$ instead of $(H^T H + \sigma^2 I)^{-1}$.
+
+### Key code addition (in `CommModule.forward`)
+```python
+if alloc_stats.get("stream_alloc_power_enabled", 0.0) > 0:
+    # Reconstruct per-antenna power weights W from importance scores
+    # ... (scatter-based computation identical to _pack_mimo_symbols)
+    ch_kwargs["stream_power_weights"] = w_sp
+```
+
+**When it activates:** Only when `stream_alloc.power.enabled = True`. When disabled, no weights are passed and the MMSE uses the standard $I$ regularisation.
+

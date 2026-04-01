@@ -501,12 +501,20 @@ class CommModule(nn.Module):
     ):
         """Apply SVD mode allocation to packed signal.
 
-        1. SVD(H) → V, Σ
-        2. S_mode = V^T @ S
-        3. Assignment + optional power in mode domain (using Σ as gains)
-        4. S' = V @ S_mode'
+        Semantic-garbling fix: the gather (importance-based reordering) now
+        operates in the **token/antenna domain** (on `packed`) BEFORE the SVD
+        projection.  This preserves per-token spatial identity and prevents
+        irreversible mixing of token information across antennas.
 
-        Returns (s_out, stats) or (packed, empty_stats) on SVD failure.
+        Pipeline:
+          1. SVD(H) → V, Σ
+          2. Gather: reorder `packed` in antenna domain (importance → strong streams)
+          3. Optional per-mode power scaling
+          4. Project to mode domain: S_mode = V^T @ packed_reordered
+          5. Transmit: S' = V @ S_mode
+
+        Returns (s_out, stats, mode_alloc_ctx) or (packed, empty_stats, None)
+        on SVD failure.
         """
         cfg = self.mode_alloc_cfg or {}
         svd_cfg = cfg.get("svd", {}) or {}
@@ -528,7 +536,6 @@ class CommModule(nn.Module):
 
         svd_result = self._compute_svd_modes(h, eps=eps)
         if svd_result is None:
-            # Bug 1 fix: return 3 values so the caller's unpack always works.
             return packed, empty_stats, None
 
         v_mat, sigma = svd_result  # V [B, n_tx, K], sigma [B, K]
@@ -555,11 +562,13 @@ class CommModule(nn.Module):
                 prune_mask[all_pruned, best_mode[all_pruned]] = False
             sigma_for_assignment = sigma.masked_fill(prune_mask, 0.0)
 
-        # Transform to mode domain: S_mode = V^T @ S
-        vt = v_mat.transpose(-2, -1)  # [B, K, n_tx]
-        s_mode = torch.matmul(vt, packed)  # [B, K, T]
+        # ------------------------------------------------------------------
+        # Semantic-garbling fix: gather in antenna/token domain FIRST,
+        # then project to SVD mode domain.
+        # ------------------------------------------------------------------
 
-        # Assignment: reorder symbols so important tokens → strong modes
+        # Assignment: reorder symbols in antenna domain so that important
+        # tokens land on the strongest SVD-mode positions.
         if assignment_enabled and t > 0 and tx_signal is not None:
             source = str(cfg.get("source", self.power_alloc_cfg.get("source", "selection_scores")))
             prioritize_cls = bool(assignment_cfg.get("prioritize_cls", True))
@@ -584,52 +593,42 @@ class CommModule(nn.Module):
                 src_orders.append(src_order)
             src_order_t = torch.tensor(src_orders, device=device, dtype=torch.long)
 
-            # Bug 2 fix: reorder operates on flat_mode (mode domain), not on
-            # packed (antenna domain).  flat_orig / flat_orig.gather was using
-            # the wrong domain — the scatter into the K×T grid must come from
-            # the already-projected s_mode so the V @ s_mode multiplication
-            # at the end is mathematically coherent.
-            # Flatten mode-domain signal, reorder, re-pack
-            # Bug 1 fix: if k * t < l (user chose num_modes < n_tx), we can't fit
-            # all L original symbols into the K*T mode capacity. We must truncate
-            # the assignment to the top min(l, k*t) most important tokens.
-            l_assign = min(l, k * t)
+            l_assign = min(l, n_tx * t)
 
             # Limit sources and positions to available capacity
             src_order_trunc = src_order_t[:, :l_assign]
             positions_trunc = positions[:, :l_assign]
 
-            flat_mode = s_mode.reshape(bsz, -1)          # [B, K*T]  mode domain
-            ordered_flat = flat_mode.gather(1, src_order_trunc)  # [B, l_assign]
+            # --- Gather in ANTENNA domain (on packed), NOT mode domain ---
+            flat_antenna = packed.reshape(bsz, -1)  # [B, n_tx*T]  antenna domain
+            ordered_flat = flat_antenna.gather(1, src_order_trunc)  # [B, l_assign]
 
-            l_pad = k * t
-            packed_mode = packed.new_zeros((bsz, l_pad))
+            l_pad_antenna = n_tx * t
+            packed_reordered = packed.new_zeros((bsz, l_pad_antenna))
             if l_assign > 0 and positions_trunc.shape[1] > 0:
-                packed_mode.scatter_(1, positions_trunc, ordered_flat)
-            s_mode = packed_mode.reshape(bsz, k, t)
+                packed_reordered.scatter_(1, positions_trunc, ordered_flat)
+            packed = packed_reordered.reshape(bsz, n_tx, t)
 
-            # Save context for unpack — include V and k so _unpack_mode_alloc
-            # can apply the inverse V^T projection after equalization.
+            # Save context for unpack
             mode_alloc_ctx = {
                 "positions": positions_trunc,
                 "src_order": src_order_trunc,
                 "l_assign": l_assign,
-                "v_mat": v_mat,   # [B, n_tx, K]  — needed for V^T in unpack
+                "v_mat": v_mat,   # [B, n_tx, K]
                 "k": k,
             }
         else:
             mode_alloc_ctx = None
 
-        # Optional power allocation in mode domain (importance-based, no CSI)
+        # --- Project to mode domain AFTER gather: S_mode = V^T @ packed ---
+        vt = v_mat.transpose(-2, -1)  # [B, K, n_tx]
+        s_mode = torch.matmul(vt, packed)  # [B, K, T]
+
+        # Optional power allocation in mode domain (importance-based)
         if power_enabled and t > 0:
             alpha     = float(power_cfg.get("alpha", 1.0))
             power_eps = float(power_cfg.get("eps",   1e-4))
 
-            # Bug 4 fix: compute per-mode weights by aggregating importance
-            # scores of the tokens assigned to each mode row, using the same
-            # positions scatter as the assignment step.
-            # Previously: mean_imp was a scalar expanded uniformly → all modes
-            # identical. Now: each mode k gets the average score of its tokens.
             if tx_signal is not None and mode_alloc_ctx is not None:
                 source = str(cfg.get("source", self.power_alloc_cfg.get("source", "selection_scores")))
                 imp_scores = self._resolve_stream_alloc_scores(
@@ -638,24 +637,25 @@ class CommModule(nn.Module):
                 )
                 _, n_tokens_tx, d_sent_tx = tx_signal.shape
                 l_imp = n_tokens_tx * d_sent_tx
-                # Expand per-token score to flat token*dim space
                 flat_imp = imp_scores.unsqueeze(-1).expand(
                     bsz, n_tokens_tx, d_sent_tx
-                ).reshape(bsz, l_imp)                         # [B, l]
-                # Re-use positions from mode_alloc_ctx (same scatter grid)
-                pos_imp = mode_alloc_ctx["positions"]          # [B, l]
-                score_grid = packed.new_zeros((bsz, k * t))
-                count_grid = packed.new_zeros((bsz, k * t))
+                ).reshape(bsz, l_imp)
+                pos_imp = mode_alloc_ctx["positions"]
+                score_grid = packed.new_zeros((bsz, n_tx * t))
+                count_grid = packed.new_zeros((bsz, n_tx * t))
                 ones_flat   = packed.new_ones((bsz, l_imp))
                 if pos_imp.shape[1] > 0:
                     score_grid.scatter_(1, pos_imp, flat_imp)
                     count_grid.scatter_(1, pos_imp, ones_flat)
-                score_grid = score_grid.reshape(bsz, k, t).sum(dim=2)   # [B, k]
-                count_grid = count_grid.reshape(bsz, k, t).sum(dim=2)   # [B, k]
-                per_mode_imp = score_grid / count_grid.clamp_min(1.0)    # [B, k]
+                score_grid = score_grid.reshape(bsz, n_tx, t).sum(dim=2)  # [B, n_tx]
+                count_grid = count_grid.reshape(bsz, n_tx, t).sum(dim=2)  # [B, n_tx]
+                # Map antenna-domain importance to mode domain via V^T
+                per_antenna_imp = score_grid / count_grid.clamp_min(1.0)  # [B, n_tx]
+                # Project to per-mode importance: w_mode = |V^T| @ w_antenna
+                # Using absolute V^T so all contributions are positive
+                per_mode_imp = torch.matmul(vt.abs(), per_antenna_imp.unsqueeze(-1)).squeeze(-1)  # [B, k]
                 weights = (per_mode_imp.clamp(min=0.0) + power_eps) ** alpha
             elif tx_signal is not None:
-                # Assignment disabled: fall back to mean importance uniformly
                 source = str(cfg.get("source", self.power_alloc_cfg.get("source", "selection_scores")))
                 imp_scores = self._resolve_stream_alloc_scores(
                     tx_signal, selection_indices, selection_scores, source,
@@ -684,7 +684,7 @@ class CommModule(nn.Module):
             post_power = s_mode.pow(2).mean(dim=(1, 2), keepdim=True)
             s_mode     = s_mode * torch.sqrt(pre_power / post_power.clamp_min(1e-9))
 
-        # Transform back: S' = V @ S_mode'
+        # Transform back: S' = V @ S_mode
         s_out = torch.matmul(v_mat[:, :, :k], s_mode)  # [B, n_tx, T]
 
         # Compute quality stats
@@ -702,15 +702,21 @@ class CommModule(nn.Module):
                 l_assign = int(mode_alloc_ctx["l_assign"])
 
                 if l_assign > 0:
-                    # Each transmitted flat symbol has a source token id and a destination mode id.
                     token_ids = torch.div(src_order, d_sent, rounding_mode="floor")
-                    mode_ids = torch.div(positions, t, rounding_mode="floor").clamp(min=0, max=k - 1)
-                    mode_gains = torch.gather(sigma, 1, mode_ids)
+                    mode_ids = torch.div(positions, t, rounding_mode="floor").clamp(min=0, max=n_tx - 1)
+                    # Use sigma mapped through antenna positions for gain eval
+                    # Since gather is in antenna domain, mode_ids index antennas
+                    antenna_gains = torch.ones((bsz, n_tx), device=device, dtype=dtype)
+                    # Approximate per-antenna gain from sigma via V
+                    # sigma_expanded [B, K] → per-antenna contribution
+                    antenna_gain_from_svd = torch.matmul(v_mat[:, :, :k].abs(), sigma.unsqueeze(-1)).squeeze(-1)  # [B, n_tx]
+                    antenna_gains = antenna_gain_from_svd
+                    stream_gains = torch.gather(antenna_gains, 1, mode_ids)
 
                     token_gain_sum = packed.new_zeros((bsz, n_tok))
                     token_gain_cnt = packed.new_zeros((bsz, n_tok))
                     ones = packed.new_ones((bsz, l_assign))
-                    token_gain_sum.scatter_add_(1, token_ids, mode_gains)
+                    token_gain_sum.scatter_add_(1, token_ids, stream_gains)
                     token_gain_cnt.scatter_add_(1, token_ids, ones)
 
                     token_gain_mean = token_gain_sum / token_gain_cnt.clamp_min(1.0)
@@ -753,16 +759,18 @@ class CommModule(nn.Module):
         return s_out, stats, mode_alloc_ctx
 
     def _unpack_mode_alloc(self, rx_packed, mode_alloc_ctx, tx_signal_shape, pack_stats):
-        """
-        Reverse mode-alloc: un-scatter in mode domain, restore token order,
-        project back to antenna/token domain with V.
+        """Reverse mode-alloc: ungather in antenna domain, restore token order.
 
-        Bug 2 fix: the equalised signal is in antenna domain [B, n_tx, T].
-        To invert the V-projection done at the transmitter we must:
-          1. Project to mode domain:  s_mode_rx = V^T @ rx_packed
-          2. Un-scatter using saved positions (reverse the assignment)
-          3. Restore token order (argsort of src_order)
-          4. Reshape to [B, N, D]
+        Coherent with the semantic-garbling fix: since the gather at the
+        transmitter now operates in the **antenna domain** (before V^T),
+        the receiver must:
+          1. Un-scatter in antenna domain (reverse the positional assignment)
+          2. Restore source token order (argsort of src_order)
+          3. Reshape to [B, N, D]
+
+        Note: We do NOT apply V^T here — the equaliser already delivers the
+        signal in antenna domain, which is the domain where the gather was
+        performed.
         """
         if mode_alloc_ctx is None:
             return rx_packed
@@ -771,28 +779,24 @@ class CommModule(nn.Module):
         n_tokens = tx_signal_shape[1]
         d_sent   = tx_signal_shape[2]
         l        = pack_stats["mimo_L"]
-        v_mat    = mode_alloc_ctx["v_mat"]   # [B, n_tx, K]
-        k        = mode_alloc_ctx["k"]
+        n_tx     = rx_packed.shape[1]
+        t        = rx_packed.shape[2]
 
-        # Step 1 — Project received (equalised, antenna domain) into mode domain
-        # rx_packed shape: [B, n_tx, T]
-        vt = v_mat.transpose(-2, -1)                  # [B, K, n_tx]
-        s_mode_rx = torch.matmul(vt, rx_packed)        # [B, K, T]
+        l_assign  = mode_alloc_ctx["l_assign"]
+        positions = mode_alloc_ctx["positions"]     # [B, l_assign]
+        src_order = mode_alloc_ctx["src_order"]     # [B, l_assign]
 
-        # Step 2/3 — Un-scatter and restore token assignment order
-        # We only transmitted l_assign symbols in mode domain
-        l_assign     = mode_alloc_ctx["l_assign"]
-        positions    = mode_alloc_ctx["positions"]     # [B, l_assign]
-        src_order    = mode_alloc_ctx["src_order"]     # [B, l_assign]
-        flat_mode_rx = s_mode_rx.reshape(bsz, -1)      # [B, K*T]
+        # Step 1 — Flatten equalised antenna-domain signal and un-scatter
+        flat_rx = rx_packed.reshape(bsz, -1)         # [B, n_tx*T]
+        rx_ordered = flat_rx.gather(1, positions)     # [B, l_assign]
 
-        rx_ordered    = flat_mode_rx.gather(1, positions)          # [B, l_assign]
-        restored_flat = rx_ordered.new_zeros((bsz, l))             # [B, L] full size containing zeros for dropped data
-        
+        # Step 2 — Restore original token order
+        restored_flat = rx_ordered.new_zeros((bsz, l))
         if l_assign > 0 and positions.shape[1] > 0:
+            restore_order = torch.argsort(src_order, dim=1)
             restored_flat.scatter_(1, src_order, rx_ordered)
 
-        # Step 4 — Reshape to token domain [B, N, D]
+        # Step 3 — Reshape to token domain [B, N, D]
         return restored_flat.reshape(bsz, n_tokens, d_sent)
 
     # ------------------------------------------------------------------
@@ -924,6 +928,59 @@ class CommModule(nn.Module):
                     ch_kwargs["h_override"] = h_override
                 elif diagonal_gains is not None:
                     ch_kwargs["diagonal_gains"] = diagonal_gains
+
+                # Propagate per-stream power weights to MMSE equaliser
+                # so it uses the correct covariance (H^T H + σ² W^{-1})^{-1}
+                if alloc_stats.get("stream_alloc_power_enabled", 0.0) > 0:
+                    # Recover the stream power weights from alloc_ctx
+                    # (the weights were applied to packed in _pack_mimo_symbols)
+                    _sp_cfg = (self.stream_alloc_cfg or {}).get("power", {}) or {}
+                    _sp_alpha = float(_sp_cfg.get("alpha", 1.0))
+                    _sp_eps   = float(_sp_cfg.get("eps", 1e-4))
+                    _sp_gain_alpha = float(_sp_cfg.get("gain_alpha", 1.0))
+                    _sp_max_ratio  = float(_sp_cfg.get("max_power_ratio", 10.0))
+                    _sp_source = str((self.stream_alloc_cfg or {}).get(
+                        "source", self.power_alloc_cfg.get("source", "selection_scores")))
+                    _sp_prioritize_cls = bool(((self.stream_alloc_cfg or {}).get(
+                        "assignment", {}) or {}).get("prioritize_cls", True))
+                    _bsz_sp = tx_signal.shape[0]
+                    _n_tokens_sp = tx_signal.shape[1]
+                    _d_sent_sp = tx_signal.shape[2]
+                    _l_sp = _n_tokens_sp * _d_sent_sp
+                    _t_sp = pack_stats["mimo_T"]
+
+                    if alloc_ctx is not None and "positions" in alloc_ctx:
+                        _tk_scores = self._resolve_stream_alloc_scores(
+                            tx_signal, selection_indices, selection_scores,
+                            _sp_source, _sp_prioritize_cls,
+                        )
+                        _flat_scores = _tk_scores.unsqueeze(-1).expand(
+                            _bsz_sp, _n_tokens_sp, _d_sent_sp
+                        ).reshape(_bsz_sp, _l_sp)
+                        _positions_sp = alloc_ctx["positions"]
+                        _l_pad_sp = self.channel.n_tx * _t_sp
+                        _sg = tx_signal.new_zeros((_bsz_sp, _l_pad_sp))
+                        _cg = tx_signal.new_zeros((_bsz_sp, _l_pad_sp))
+                        _of = tx_signal.new_ones((_bsz_sp, _l_sp))
+                        if _positions_sp.shape[1] > 0:
+                            _sg.scatter_(1, _positions_sp, _flat_scores)
+                            _cg.scatter_(1, _positions_sp, _of)
+                        _sg = _sg.reshape(_bsz_sp, self.channel.n_tx, _t_sp).sum(dim=2)
+                        _cg = _cg.reshape(_bsz_sp, self.channel.n_tx, _t_sp).sum(dim=2)
+                        _w_sp = _sg / _cg.clamp_min(1.0)
+                        _w_sp = (_w_sp.clamp(min=0.0) + _sp_eps) ** _sp_alpha
+                    else:
+                        _w_sp = tx_signal.new_ones((_bsz_sp, self.channel.n_tx))
+
+                    _gains_sp = diagonal_gains if diagonal_gains is not None else tx_signal.new_ones((_bsz_sp, self.channel.n_tx))
+                    if _sp_gain_alpha != 0.0:
+                        _w_sp = _w_sp * _gains_sp.clamp_min(1e-6) ** _sp_gain_alpha
+                    _w_sp = _w_sp.clamp_min(1e-9)
+                    if _sp_max_ratio > 1.0:
+                        _mx = _w_sp.max(dim=1, keepdim=True).values
+                        _w_sp = torch.maximum(_w_sp, _mx / _sp_max_ratio)
+                    _w_sp = _w_sp / _w_sp.mean(dim=1, keepdim=True).clamp_min(1e-9)
+                    ch_kwargs["stream_power_weights"] = _w_sp
 
                 rx_packed, ch_stats = self.channel(packed, **ch_kwargs)
 

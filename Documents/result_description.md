@@ -49,6 +49,33 @@ Test without using the Bottleneck tool.
 
 ![Measured Post-Equalization SNR Heatmap](../Plots/scenario_2/plt3.png)
 
+# Scenario 3
+
+Test by using the upgraded procedure with:
+
+- ghater applied on antenna domain before the channel projection svd.
+- the equalizer MMSE accept the optional parameter stream_power_weights, so the filter is now aligned with the true covariance of the trasmitted symbols.
+
+For detailed information about the changes, see the `comm_module_upgrade.md` and `mimo_upgrade.md` files.
+
+In addition the MIMO diagonal baseline is computed with gains that are drawn for each sample in the batch. This with the aim to study if the performance of the diagonal baseline is affected by the fact that the gains are not the same for all the samples in the batch.
+
+the bottleneck is not used in this scenario.
+
+## 3. Plots
+
+### 3.1. Best Validation Accuracy Heatmap
+
+![Best Validation Accuracy Heatmap](../Plots/scenario_3/plt1.png)
+
+### 3.2. Validation Accuracy Evolution per Epoch
+
+![Validation Accuracy Evolution per Epoch](../Plots/scenario_3/plt2.png)
+
+### 3.3. Measured Post-Equalization SNR Heatmap
+
+![Measured Post-Equalization SNR Heatmap](../Plots/scenario_3/plt3.png)
+
 # Testing SVD Parameters
 
 Testing with different SVD parameters. Specifically, the following configurations were tested exclusively (one at a time):
@@ -57,26 +84,26 @@ Testing with different SVD parameters. Specifically, the following configuration
 - **Alpha parameter**: Using `alpha = 0.7 and 0.5` instead of `1.0` within the internal SVD semantic waterfilling.
 - **Chunk size**: Using a chunk size of 4 instead of 1.
 
-For Plot 3.2, the reference value is the average validation accuracy across different noise configurations for the SVD case with the bottleneck deactivated. This comparison aims to determine if the SVD parameter modifications yield performance improvements over the base case.
+For Plot SVD.2, the reference value is the average validation accuracy across different noise configurations for the SVD case with the bottleneck deactivated. This comparison aims to determine if the SVD parameter modifications yield performance improvements over the base case.
 
-## 3. Plots
+## SVD Plots
 
-### 3.1. Best Validation Accuracy Heatmap
+### SVD.1. Best Validation Accuracy Heatmap
 
 ![Best Validation Accuracy Heatmap](../Plots/testing_svd/plt1.png)
 
-### 3.2. Validation Accuracy Evolution per Epoch
+### SVD.2. Validation Accuracy Evolution per Epoch
 
 ![Validation Accuracy Evolution per Epoch](../Plots/testing_svd/plt2.png)
 
-### 3.3. Measured Post-Equalization SNR Heatmap
+### SVD.3. Measured Post-Equalization SNR Heatmap
 
 ![Measured Post-Equalization SNR Heatmap](../Plots/testing_svd/plt3.png)
 
 # Comparison between Baseline with Channel/ADC Active vs. Without
 
-## 4. Plots
+## Comparison Plots
 
-### 4.1. Validation Accuracy Evolution per Epoch
+### Comparison.1. Validation Accuracy Evolution per Epoch
 
 ![Validation Accuracy Evolution per Epoch](../Plots/comparison_clean/plt1.png)
