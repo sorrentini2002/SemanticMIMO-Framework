@@ -433,82 +433,74 @@ Generates tracking metrics automatically thoroughly fully completely natively na
 
 ---
 
-## 10. Semantic Garbling Fix — `_apply_mode_alloc` reordering domain change
+## 10. SVD Mode Allocation — Corrected TX/RX chain
 
-### Problem: irreversible token mixing
+### Problem: V @ V^T = Identity cancellation
 
-The previous implementation performed the SVD projection ($V^T \cdot \text{packed}$) **before** the importance-based gather. This meant the reordering operated in the **mode domain**, where each mode is a linear combination of all antennas. Gathering in mode domain irreversibly mixes spatial token information across antennas, destroying the Transformer's attention structure ("semantic garbling").
+The previous implementation applied `V^T` at the transmitter (projecting packed into mode domain) and then `V` to create the antenna signal: `s_out = V @ V^T @ packed_reordered`. When $K = n_{tx}$ (no pruning), $V V^T = I$, meaning the SVD projection was completely cancelled and the signal was transmitted without any mode-domain benefit.
 
-### Previous pipeline (buggy)
-```
-packed [B, n_tx, T]
-  → V^T @ packed → s_mode [B, K, T]   ← spatial mixing happens HERE
-  → gather(s_mode, src_order)          ← too late, tokens are already mixed
-  → scatter into mode grid
-  → V @ s_mode → s_out [B, n_tx, T]
-```
-
-### Fixed pipeline
+### Corrected TX pipeline (`_apply_mode_alloc`)
 ```
 packed [B, n_tx, T]
   → gather(packed, src_order)          ← reorder in ANTENNA domain (tokens intact)
-  → scatter into antenna grid
-  → V^T @ packed_reordered → s_mode   ← project AFTER ordering
-  → V @ s_mode → s_out [B, n_tx, T]
+  → scatter into K×T MODE GRID         ← result IS s_mode (mode domain)
+  → optional power scaling on s_mode
+  → s_out = V @ s_mode                 ← project mode → antenna for transmission
 ```
 
-### Key code change
+**Key insight:** The scatter result is directly the mode-domain signal. No `V^T` multiplication is needed because the positions (derived from σ ranking) already place tokens into the correct mode rows. The `V @` projection then maps these mode-domain values onto antenna ports.
+
+### Key code
 ```python
-# BEFORE (mode domain — WRONG):
-flat_mode = s_mode.reshape(bsz, -1)          # mode domain
-ordered_flat = flat_mode.gather(1, src_order_trunc)
-
-# AFTER (antenna domain — CORRECT):
-flat_antenna = packed.reshape(bsz, -1)       # antenna domain
+# Gather from antenna-domain packed
+flat_antenna = packed.reshape(bsz, -1)          # [B, n_tx*T]
 ordered_flat = flat_antenna.gather(1, src_order_trunc)
-```
 
-**What changed:** The gather now operates on `packed` (antenna domain) rather than `s_mode` (mode domain). The SVD projection `V^T @ packed` is applied only after the positional reordering is complete. This preserves per-token spatial identity: each token's feature vector remains coherent and is never mixed with other tokens' data before being assigned to a strong SVD mode.
+# Scatter into MODE-domain grid — this IS s_mode
+l_pad_mode = k * t
+s_mode_flat = packed.new_zeros((bsz, l_pad_mode))
+s_mode_flat.scatter_(1, positions_trunc, ordered_flat)
+s_mode = s_mode_flat.reshape(bsz, k, t)
+
+# Project to antenna domain
+s_out = torch.matmul(v_mat[:, :, :k], s_mode)  # [B, n_tx, T]
+```
 
 ### Capacity bound
-The `l_assign` truncation now uses `n_tx * t` instead of `k * t` since the gather operates in antenna-domain space (full `n_tx` rows), not the potentially reduced `k`-mode space.
-
-### Power allocation adjustment
-When `mode_alloc.power.enabled = True`, per-mode importance weights are now computed by:
-1. Aggregating per-token scores in antenna domain (via positions scatter)
-2. Projecting antenna importance to mode importance via $|V^T| \cdot w_\text{antenna}$
-
-This replaces the previous direct scatter into mode-domain grids that was conceptually inconsistent.
+`l_assign = min(l, k * t)` — uses mode-domain capacity (K×T), not antenna-domain (n_tx×T).
 
 ---
 
-## 11. `_unpack_mode_alloc` — Simplified to antenna-domain ungather
+## 11. `_unpack_mode_alloc` — V^T projection restored at receiver
 
-### Previous version
-Required a `V^T` projection on the received signal to convert from antenna domain to mode domain before un-scattering, because the TX gather operated in mode domain:
-```python
-# Step 1: V^T @ rx_packed → s_mode_rx  (project to mode domain)
-# Step 2: gather(s_mode_rx, positions)   (un-scatter in mode domain)
-# Step 3: scatter(src_order, ...)        (restore token order)
-```
+### Why V^T is needed at RX
 
-### Updated version
-Since the TX gather now operates in antenna domain, the receiver un-scatter also operates directly in antenna domain — **no V^T projection needed**:
+The transmitter sends `s_out = V @ s_mode`. The equaliser returns $\hat{x}_{ant} \approx V \cdot s_{mode}$. To recover `s_mode` and reverse the scatter/gather, we must first project back to mode domain:
+
+$$s_{mode,rx} = V^T \cdot \hat{x}_{ant} \approx V^T V \cdot s_{mode} = s_{mode}$$
+
+### Code
 ```python
 def _unpack_mode_alloc(self, rx_packed, mode_alloc_ctx, tx_signal_shape, pack_stats):
-    # Step 1 — Flatten equalised antenna-domain signal and un-scatter
-    flat_rx = rx_packed.reshape(bsz, -1)         # [B, n_tx*T]
-    rx_ordered = flat_rx.gather(1, positions)     # [B, l_assign]
+    v_mat = mode_alloc_ctx["v_mat"]   # [B, n_tx, K]
+    k     = mode_alloc_ctx["k"]
 
-    # Step 2 — Restore original token order
+    # Step 1 — Project to mode domain
+    vt = v_mat.transpose(-2, -1)                  # [B, K, n_tx]
+    s_mode_rx = torch.matmul(vt, rx_packed)        # [B, K, T]
+
+    # Step 2 — Un-scatter from mode grid
+    flat_mode = s_mode_rx.reshape(bsz, -1)          # [B, K*T]
+    rx_ordered = flat_mode.gather(1, positions)     # [B, l_assign]
+
+    # Step 3 — Restore original token order
     restored_flat = rx_ordered.new_zeros((bsz, l))
     restored_flat.scatter_(1, src_order, rx_ordered)
 
-    # Step 3 — Reshape to token domain [B, N, D]
     return restored_flat.reshape(bsz, n_tokens, d_sent)
 ```
 
-**What changed:** The `V^T` projection step was removed entirely from the unpack path. The equaliser delivers the received signal in antenna domain, which is exactly the domain where the gather was performed at the transmitter, so no domain conversion is necessary. This makes the unpack simpler, faster, and mathematically coherent with the new TX pipeline.
+**What changed:** `V^T` projection is back at the receiver because the TX no longer applies `V^T`. The scatter/un-scatter now consistently operates in mode domain (K×T grid) on both sides.
 
 ---
 
@@ -529,4 +521,73 @@ if alloc_stats.get("stream_alloc_power_enabled", 0.0) > 0:
 ```
 
 **When it activates:** Only when `stream_alloc.power.enabled = True`. When disabled, no weights are passed and the MMSE uses the standard $I$ regularisation.
+
+---
+
+## 13. Architectural distinction: Mode Allocation vs Power Allocation
+
+### Overview
+
+After the semantic garbling fix, the Mode Allocation pipeline is no longer a "copy" of Power Allocation operating in a different domain. The two mechanisms serve fundamentally different purposes:
+
+| Aspect | Power Allocation (`power_alloc` / `stream_alloc.power`) | Mode Allocation (`mode_alloc`) |
+|---|---|---|
+| **What it does** | Scales signal **amplitude** per token or per antenna | Maps tokens onto physical **channel modes** (SVD eigenvectors) |
+| **Domain** | Operates on token values (amplitude scaling) | Operates as **interface between tokens and channel geometry** |
+| **Channel type** | Works on Diagonal and Rayleigh | Rayleigh only (requires SVD decomposition of $H$) |
+| **Goal** | Protect important tokens by giving them more energy | Maximise transport capacity by routing important tokens through strong physical "pipes" |
+| **Mechanism** | $\text{token} \leftarrow \text{token} \times \sqrt{w_i}$ | $\text{gather}(\text{packed}, \text{src\_order}) \to \text{scatter}(\text{positions})$ |
+
+### How Mode Allocation works (post-fix pipeline)
+
+The SVD of the channel matrix $H = U \Sigma V^T$ reveals the physical "pipes" (singular modes) of the channel. Each mode has a gain $\sigma_i$: a large $\sigma_i$ means a wide, high-capacity pipe; a small $\sigma_i$ means a narrow, lossy pipe.
+
+**The Mode Allocation decides which token travels in which pipe:**
+
+```
+Step 1: SVD(H) → V, Σ = [σ₁ ≥ σ₂ ≥ ... ≥ σₖ]
+        Strongest mode σ₁ = "wide pipe", weakest σₖ = "narrow pipe"
+
+Step 2: Gather (antenna domain)
+        ordered_flat = packed.reshape(bsz, -1).gather(1, src_order_trunc)
+        ↑ src_order ranks tokens by importance: most important first
+
+Step 3: Scatter into K×T mode grid
+        s_mode_flat.scatter_(1, positions_trunc, ordered_flat)
+        s_mode = s_mode_flat.reshape(bsz, k, t)
+        ↑ positions maps strongest-mode rows to earliest flat slots
+        → Most important token lands in mode row with σ₁
+
+Step 4: Transmit via V-precoding
+        s_out = V @ s_mode  (mode domain → antenna domain)
+        → Channel: y = H @ V @ s_mode + noise
+        → Equaliser returns x̂ ≈ V @ s_mode
+
+Step 5: Receive: V^T projection + ungather
+        s_mode_rx = V^T @ x̂ ≈ s_mode
+        → un-scatter from mode grid, restore token order
+```
+
+### Why the order matters
+
+**Before fix (buggy):** Steps 4 and 2 were swapped. The SVD projection happened *first*, mixing all tokens across all antenna rows. Then gathering in mode domain reordered already-mixed signals — the damage was done. This is like shuffling envelopes *after* mixing all letters together: you can no longer guarantee which letter ends up in which envelope.
+
+**After fix (correct):** The gather happens in antenna domain where each token's spatial identity is intact. It's like sorting letters into envelopes *first*, then sealing and shipping them through pipes of different widths. The most important letter goes through the widest pipe.
+
+### Complementary roles
+
+Power Allocation and Mode Allocation can work **together**:
+
+1. **Power Allocation** (upstream): Amplifies important tokens — gives them a louder voice
+2. **Mode Allocation** (downstream): Routes the already-amplified tokens through the strongest channel modes — ensures they use the best physical path
+
+The result is a two-level semantic protection:
+- The important token has **more energy** (Power Alloc)
+- AND it travels through the **least lossy** channel mode (Mode Alloc)
+
+### Mode power scaling (optional sub-component)
+
+The `mode_alloc.power` sub-feature is a secondary power adjustment that operates *within* Mode Allocation's pipeline, in the mode domain. Per-mode importance is computed by scattering token importance scores into the K×T mode grid using the same positions, then aggregating per mode row.
+
+This is conceptually different from `stream_alloc.power` (which scales antennas based on diagonal gains) — it adjusts mode-level energy based on the aggregate importance of tokens that were mapped to each mode.
 

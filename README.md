@@ -66,7 +66,6 @@ Provides a detailed description of the ongoing experimental test, including mode
 
 ### Documents/result_description.md
 Provides a detailed description of the results of the ongoing experimental test, including a set of plots that summarize the results.
-* 📖 **Read more:** [Current Result Description](Documents/result_description.md)
 
 ---
 
