@@ -597,17 +597,20 @@ class CommModule(nn.Module):
             src_order_trunc = src_order_t[:, :l_assign]
             positions_trunc = positions[:, :l_assign]
 
-            # Gather from antenna-domain packed (preserves token identity)
-            flat_antenna = packed.reshape(bsz, -1)  # [B, n_tx*T]
-            ordered_flat = flat_antenna.gather(1, src_order_trunc)  # [B, l_assign]
+            # CRITICAL: gather directly from PACKED (pure token domain)
+            flat_packed = packed.reshape(bsz, -1)
+            ordered_flat = flat_packed.gather(1, src_order_trunc)  # [B, l_assign]
 
-            # Scatter into MODE-domain grid [B, K*T]
-            # The scatter result IS s_mode — no V^T needed
-            l_pad_mode = k * t
-            s_mode_flat = packed.new_zeros((bsz, l_pad_mode))
+            # Build empty mode grid (K x T)
+            l_pad = k * t
+            packed_mode = packed.new_zeros((bsz, l_pad))
+
+            # Place pure tokens onto best SVD modes
             if l_assign > 0 and positions_trunc.shape[1] > 0:
-                s_mode_flat.scatter_(1, positions_trunc, ordered_flat)
-            s_mode = s_mode_flat.reshape(bsz, k, t)
+                packed_mode.scatter_(1, positions_trunc, ordered_flat)
+
+            # This is the true signal in mode domain
+            s_mode = packed_mode.reshape(bsz, k, t)
 
             mode_alloc_ctx = {
                 "positions": positions_trunc,
