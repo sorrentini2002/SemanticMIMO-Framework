@@ -54,7 +54,6 @@ Test without using the Bottleneck tool.
 Test by using the upgraded procedure with:
 
 - ghater applied on antenna domain before the channel projection svd.
-- The power allocation is disabled because the mode allocation is now done before the channel projection svd.
 - the equalizer MMSE accept the optional parameter stream_power_weights, so the filter is now aligned with the true covariance of the trasmitted symbols.
 
 For detailed information about the changes, see the `comm_module_upgrade.md` and `mimo_upgrade.md` files.

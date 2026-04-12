@@ -88,15 +88,34 @@ It is essential to distinguish the two levels of energy optimization:
 
 ---
 
-## 4. Compression Method (`configs/method/proposal.yaml`)
-Manages how to select and drop tokens or samples to stay within the communication budget.
+## 4. Compression Methods (`configs/method/`)
+These modules determine how to select and drop tokens or samples to stay within the communication budget.
+
+### Proposal Method (`proposal.yaml`)
+Standard method based on attention or clustering.
 
 | Parameter | Description |
 | :--- | :--- |
 | **`desired_compression`** | Global goal for data reduction (e.g. `0.1` = keep 10% of original data). |
-| **`token_compression`** | Percentage of tokens (patches) to keep for each image. |
+| **`token_compression`** | Amount of tokens (patches) to keep for each image. |
 | **`batch_compression`** | Percentage of images to keep within a batch through clustering. |
 | **`pooling`**| Importance calculation method: `attention` (self-attention scores), `average`, `cls`. |
+
+### Gumbel Method (`gumbel.yaml`)
+Advanced method using **Gumbel-Softmax** to learn an optimal token selection mask in a differentiable way.
+
+| Parameter | Description |
+| :--- | :--- |
+| **`desired_compression`** | Target ratio of tokens to keep (e.g. `0.1`). |
+| **`tau_start` / `tau_end`** | Initial and final temperature for Gumbel-Softmax annealing. |
+| **`steps`** | Number of training steps for the temperature schedule. |
+| **`hard`** | If `true`, uses discrete (one-hot) mask in forward pass. |
+| **`entropy_reg_weight`** | Weight of entropy regularization to avoid selection collapse. |
+| **`cov_reg_weight`** | Weight of coverage regularization to ensure spatial diversity. |
+| **`eval_k`** | Fixed number of tokens kept during evaluation/inference. |
+| **`gumbel_mc_samples`** | Number of Monte Carlo samples used during evaluation for robust mask estimation. |
+| **`semantic_waterfilling`** | If `true`, applies a waterfilling strategy on the learned scores. |
+| **`diversify_enabled`** | Enables an additional loss to maximize the information diversity of selected tokens. |
 
 
 ---
@@ -107,7 +126,7 @@ Configures data loading.
 *   **`name`**: Dataset identifier.
 *   **`num_classes`**: Number of classes for final classification.
 *   **`batch_size`**: Images loaded per iteration.
-*   **`max_communication`**: Transmittable sample limit (data budget).
+*   **`num_epochs`**: Number of epochs used to train the model.
 *   **`selection_criterion`**: Criterion for choosing the "best epoch" saved in the results:
     *   `average`: Average accuracy across all SNRs of the eval sweep (default).
     *   `last`: Always saves the last completed epoch.

@@ -42,6 +42,7 @@ test:
 name : flowers-102
 num_classes : 102 
 batch_size : 128
+num_epochs: 10
 # Criterion for selecting the "best" model
 # Options: "average" (mean across SNR sweep), "last" (last completed epoch), 
 #          "max_noise" (accuracy at lowest SNR), "min_noise" (accuracy at highest SNR),

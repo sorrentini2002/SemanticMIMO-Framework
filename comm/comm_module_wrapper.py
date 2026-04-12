@@ -56,6 +56,20 @@ class CommModuleWrapper(nn.Module):
         # Updated on every forward call; accessible for logging.
         self.last_info: dict = {}
 
+        # --- Channel eval-only mode ---
+        # When True, the radio channel is bypassed during training
+        # (self.training=True) and active during eval. This allows
+        # training a clean model while validating against noisy conditions.
+        self._channel_eval_only = False
+        # Cache the original config value so we can restore it.
+        self._cfg_use_channel = self.comm.use_channel
+        
+        # --- Semantic Waterfilling Toggle ---
+        # When True (default), selection scores are extracted and sent to the
+        # CommModule. When False, we pretend no scores exist (returns None),
+        # which causes CommModule to use uniform allocation and no assignment.
+        self.semantic_waterfilling = True
+
     # ----------------------------------------------------------
     # Score wiring (called once from proposal.build_model)
     # ----------------------------------------------------------
@@ -82,10 +96,10 @@ class CommModuleWrapper(nn.Module):
         """
         Extract class-token attention scores from the score source.
 
-        Returns [B, N] tensor or None if scores are unavailable or
-        have an incompatible shape (safe fallback → uniform allocation).
+        Returns [B, N] tensor or None if scores are unavailable,
+        incompatible shape, or semantic_waterfilling is disabled.
         """
-        if self._score_source is None:
+        if not self.semantic_waterfilling or self._score_source is None:
             return None
 
         bsz, n_tokens, _ = x.shape
@@ -149,6 +163,12 @@ class CommModuleWrapper(nn.Module):
             out (Tensor): Reconstructed features [B, N, D].
                           Shape is identical to input.
         """
+        # --- Channel eval-only toggle ---
+        # Temporarily override use_channel based on train/eval phase.
+        if self._channel_eval_only:
+            self.comm.use_channel = (not self.training) and self._cfg_use_channel
+        # (If _channel_eval_only is False, use_channel stays as configured.)
+
         # --- Read importance scores for advanced allocation ---
         selection_scores = self._get_selection_scores(x)
 
@@ -175,6 +195,29 @@ class CommModuleWrapper(nn.Module):
             wandb.log(ch_stats)
         """
         return dict(self.last_info)
+
+    def set_channel_eval_only(self, enabled: bool) -> None:
+        """
+        Toggle channel eval-only mode.
+
+        When enabled:
+          - Training:   channel is bypassed (identity pass-through)
+          - Evaluation: channel is active (per original config)
+
+        This allows training a clean model while validating it
+        against a noisy channel in a single run.
+
+        Args:
+            enabled: True to activate eval-only channel mode.
+        """
+        self._channel_eval_only = enabled
+        # If disabling, restore the original config value immediately.
+        if not enabled:
+            self.comm.use_channel = self._cfg_use_channel
+
+    def set_semantic_waterfilling(self, enabled: bool) -> None:
+        """Dynamically enable or disable semantic waterfilling."""
+        self.semantic_waterfilling = enabled
 
     def reconfigure(self, config_snippet: dict) -> None:
         """

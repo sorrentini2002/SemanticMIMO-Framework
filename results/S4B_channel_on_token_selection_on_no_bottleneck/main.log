@@ -1,0 +1,14 @@
+[2026-04-12 12:01:56,680][timm.models._builder][INFO] - Loading pretrained weights from Hugging Face hub (timm/deit_tiny_patch16_224.fb_in1k)
+[2026-04-12 12:01:56,821][httpx][INFO] - HTTP Request: HEAD https://huggingface.co/timm/deit_tiny_patch16_224.fb_in1k/resolve/main/model.safetensors "HTTP/1.1 302 Found"
+[2026-04-12 12:01:56,822][huggingface_hub.utils._http][WARNING] - Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+[2026-04-12 12:01:56,823][timm.models._hub][INFO] - [timm/deit_tiny_patch16_224.fb_in1k] Safe alternative available for 'pytorch_model.bin' (as 'model.safetensors'). Loading weights using safetensors.
+[2026-04-12 12:01:56,834][timm.models._builder][INFO] - Missing keys (head.weight, head.bias) discovered while loading pretrained weights. This is expected if model is being adapted.
+[2026-04-12 12:46:07,551][timm.models._builder][INFO] - Loading pretrained weights from Hugging Face hub (timm/deit_tiny_patch16_224.fb_in1k)
+[2026-04-12 12:46:07,675][httpx][INFO] - HTTP Request: HEAD https://huggingface.co/timm/deit_tiny_patch16_224.fb_in1k/resolve/main/model.safetensors "HTTP/1.1 302 Found"
+[2026-04-12 12:46:07,751][httpx][INFO] - HTTP Request: GET https://huggingface.co/api/models/timm/deit_tiny_patch16_224.fb_in1k/xet-read-token/80e968688553f219e4a86f940ed945a23709c16f "HTTP/1.1 200 OK"
+[2026-04-12 12:46:09,062][timm.models._hub][INFO] - [timm/deit_tiny_patch16_224.fb_in1k] Safe alternative available for 'pytorch_model.bin' (as 'model.safetensors'). Loading weights using safetensors.
+[2026-04-12 12:46:09,078][timm.models._builder][INFO] - Missing keys (head.weight, head.bias) discovered while loading pretrained weights. This is expected if model is being adapted.
+[2026-04-12 12:48:29,050][timm.models._builder][INFO] - Loading pretrained weights from Hugging Face hub (timm/deit_tiny_patch16_224.fb_in1k)
+[2026-04-12 12:48:29,214][httpx][INFO] - HTTP Request: HEAD https://huggingface.co/timm/deit_tiny_patch16_224.fb_in1k/resolve/main/model.safetensors "HTTP/1.1 302 Found"
+[2026-04-12 12:48:29,215][timm.models._hub][INFO] - [timm/deit_tiny_patch16_224.fb_in1k] Safe alternative available for 'pytorch_model.bin' (as 'model.safetensors'). Loading weights using safetensors.
+[2026-04-12 12:48:29,226][timm.models._builder][INFO] - Missing keys (head.weight, head.bias) discovered while loading pretrained weights. This is expected if model is being adapted.

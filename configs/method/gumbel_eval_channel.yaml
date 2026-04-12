@@ -1,0 +1,39 @@
+model:
+  _target_: methods.gumbel_method.model
+  method_cfg: ${..parameters}
+name: gumbel_eval_channel
+parameters:
+  desired_compression: null
+  token_compression: 1.0     
+  compression_enabled: false  # disable token selection entirely
+  channel_eval_only: true     # channel active only during validation
+  semantic_waterfilling: true  # allows passing attention scores for semantic channel allocation even when compression is disabled
+  
+  # --- GUMBEL CORE ---
+  tau_start: 2.0
+  tau_end: 0.1
+  schedule: linear
+  steps: 10000
+  hard: true
+  straight_through: true
+  
+  # --- LOSS / REGULARIZATION (Algoritmico) ---
+  entropy_reg_enabled: true
+  entropy_reg_weight: 0.1
+  
+  cov_reg_enabled: true
+  cov_reg_weight: 0.5
+  cov_reg_margin: 0.3
+  cov_reg_max_tokens: 64
+  
+  # --- FASE DI VALUTAZIONE / INFERENZA ---
+  eval_k: null
+  gumbel_mc_enabled: true
+  gumbel_mc_samples: 16
+  gumbel_mc_tau: 0.5
+  gumbel_mc_aggregate: "mean"
+  
+  # --- DIVERSIFY CONFIG ---
+  diversify_enabled: false
+  diversify_lambda: 0.2
+  diversify_metric: "cosine"

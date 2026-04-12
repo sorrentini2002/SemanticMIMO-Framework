@@ -27,7 +27,7 @@ OmegaConf.register_new_resolver("flatten_params", flatten_params)
 
 
 # Standard training phase 
-def training_phase(model, train_data_loader, loss, optimizer, device, plot, max_communication):
+def training_phase(model, train_data_loader, loss, optimizer, device, plot):
 
     if plot:
         print("\nTraining phase: ")
@@ -73,6 +73,10 @@ def training_phase(model, train_data_loader, loss, optimizer, device, plot, max_
         # Get batch loss
         batch_loss = loss(batch_predictions, batch_labels)
 
+        # Add regularization loss from Gumbel method (if available)
+        if hasattr(model, 'last_reg_loss') and model.last_reg_loss is not None:
+            batch_loss = batch_loss + model.last_reg_loss
+
         iterations+=1
 
         # Store them
@@ -85,11 +89,6 @@ def training_phase(model, train_data_loader, loss, optimizer, device, plot, max_
         # Update and zero out previous gradients
         optimizer.step()
         optimizer.zero_grad()
-
-        # Check communication
-        if model.communication > max_communication: 
-            break
-
 
     # Compute average loss and accuracy
     average_train_loss = train_loss / iterations
@@ -155,7 +154,7 @@ def validation_phase(model, val_data_loader, loss, device, plot):
   return average_val_loss, average_val_accuracy, average_epoch_stats
 
 # Standard training / validation cicle
-def training_schedule(model, train_data_loader, val_data_loader, optimizer, max_communication, device, hydra_output_dir, cfg, loss=torch.nn.CrossEntropyLoss(),  plot=True, save_model=True):
+def training_schedule(model, train_data_loader, val_data_loader, optimizer, num_epochs, device, hydra_output_dir, cfg, loss=torch.nn.CrossEntropyLoss(),  plot=True, save_model=True):
 
     # Lists to store results 
     train_losses, train_accuracies, val_losses, val_accuracies, communication_cost = [], [], [], [], []
@@ -169,13 +168,13 @@ def training_schedule(model, train_data_loader, val_data_loader, optimizer, max_
     best_results_file = os.path.join(hydra_output_dir, "best_training_results.json")
     results = {}
     try:
-        for epoch in range(1, 1000):
+        for epoch in range(1, num_epochs + 1):
             torch.cuda.empty_cache()
             if plot:
                 print(f"\n\nEPOCH {epoch}")
 
             # Training phase 
-            avg_train_loss, avg_train_accuracy, train_stats = training_phase(model, train_data_loader, loss, optimizer, device, plot, max_communication)
+            avg_train_loss, avg_train_accuracy, train_stats = training_phase(model, train_data_loader, loss, optimizer, device, plot)
             
             # --- Validation and SNR Sweep ---
             snr_sweep = []
@@ -331,10 +330,6 @@ def training_schedule(model, train_data_loader, val_data_loader, optimizer, max_
             with open(final_results_file, "w") as f:
                 json.dump(results, f, indent=4)
 
-            # Check communication 
-            if model.communication > max_communication:
-                break
-
     finally:
         # Final save on completion or interruption
         if results:
@@ -355,7 +350,9 @@ def main(cfg):
 
     # Get dataset parameters
     batch_size = cfg.dataset.batch_size
-    max_communication = cfg.dataset.max_communication
+    num_epochs = int(cfg.dataset.get('num_epochs', cfg.hyperparameters.get('num_epochs', 10)))
+    if num_epochs <= 0:
+        raise ValueError("dataset.num_epochs must be a positive integer")
     num_workers = cfg.dataset.get('num_workers', 8)
 
     # Get datasets
@@ -432,7 +429,7 @@ def main(cfg):
 
         os.makedirs(hydra_output_dir, exist_ok=True)
         # Train
-        training_schedule(model, train_dataloader, val_dataloader, optimizer, max_communication, device, hydra_output_dir, cfg,
+        training_schedule(model, train_dataloader, val_dataloader, optimizer, num_epochs, device, hydra_output_dir, cfg,
                           save_model=seed == seeds[0])
 
     return

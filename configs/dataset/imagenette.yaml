@@ -44,4 +44,4 @@ name : imagenette
 num_classes : 10
 batch_size : 128
 num_workers: 8
-max_communication: 10000 # Lower default budget for faster runs.
+num_epochs: 10

@@ -42,7 +42,7 @@ test:
 name: cifar100
 num_classes: 100
 batch_size: 128
-max_communication: 75000
+num_epochs: 10
 
 # Criterion for selecting the "best" model
 # Options: "average" (mean across SNR sweep), "last" (last completed epoch), 
