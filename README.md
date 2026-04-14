@@ -69,7 +69,7 @@ Provides a detailed description of the results of the ongoing experimental test,
 * 📖 **Read more:** [Current Result Description](Documents/result_description.md)
 
 ### Documents/baseline_description.md
-Defines the 8 baseline experimental scenarios (S1 through S4c) with detailed specifications of compression, channel, and training configurations. Maps each scenario to its corresponding results folder structure for systematic comparison.
+Defines the 11 baseline experimental scenarios (S1 through S5, with hierarchical tags like MIS/ROB and B/S/BS) with detailed specifications of compression, channel, and training configurations. Maps each scenario to its corresponding results folder structure for systematic comparison.
 * 📖 **Read more:** [Baseline Scenario Definitions](Documents/baseline_description.md)
 
 ---

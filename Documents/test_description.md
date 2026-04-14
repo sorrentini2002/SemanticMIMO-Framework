@@ -15,16 +15,27 @@ The model architecture is not executed entirely on a single node but is divided 
 - **Split Index**: 3.
 - **Logic**: The network is split at index 3. The initial parts of the model process the original image and generate intermediate representations (feature maps or latent tokens). These representations are then processed by the compression method before being sent to the remaining part of the network to complete the classification.
 
-## 3. Compression Method (Proposal)
-The test evaluates a specific method called **Proposal**, whose primary purpose is to reduce bandwidth usage (data compression) at the split point.
+## 3. Compression Method (Gumbel)
+The test evaluates the **Gumbel** method, which implements a learnable token selection mechanism using Gumbel-Softmax to perform data compression at the split point.
 
-- **Desired Compression Factor**: 0.1 (i.e., a reduction to 10% of the original size).
-- **Pooling Mechanism**: The method uses an **Attention Pooling** system to synthesize relevant information from the tokens produced by the ViT before transmission.
-- **Parameters**:
-  - `desired_compression`: 0.1
-  - `pooling`: attention
-  - `token_compression`: disabled (null)
-  - `batch_compression`: disabled (null)
+### Core Gumbel-Softmax Parameters
+- **`desired_compression` (0.1)**: The target selection ratio. For a ViT-Tiny with 197 total tokens (196 patches + 1 CLS token), the model is constrained to select approximately 20 tokens for transmission to the server.
+- **`compression_enabled` (true)**: Toggles the token selection module. When active, only a subset of tokens is transmitted based on the selection logic.
+- **`hard` (true)**: During the forward pass, this forces the Gumbel-Softmax distribution to be sampled as a discrete k-hot vector. This ensures that the model operates in a true "selection" mode (token is either sent or not) rather than a weighted mixing of tokens.
+- **`straight_through` (true)**: Enables the Straight-Through Estimator (STE). Since discrete sampling is non-differentiable, STE uses the discrete selection in the forward pass but uses the gradient of the continuous "soft" scores in the backward pass, allowing the selection policy to be trained via backpropagation.
+- **Temperature Annealing**:
+  - **`tau_start` (2.0) / `tau_end` (0.1)**: Controls the "stiffness" of the selection distribution. A high temperature (2.0) makes the selection almost uniform and stochastic, promoting exploration. A low temperature (0.1) makes the distribution peaky and deterministic.
+  - **`schedule` (linear) / `steps` (10000)**: The temperature $\tau$ decays linearly from start to end over 10,000 optimization steps. This "cools down" the system, transitioning from an exploratory phase to a stable selection policy as training progresses.
+
+### Regularization and Diversity
+- **`entropy_reg_weight` (0.1)**: Penalizes the model if the selection probability distribution becomes too deterministic too early (low entropy). This forces the model to explore different token combinations and prevents "collapse" where it might always pick the same spatial locations regardless of image content.
+- **`cov_reg_weight` (0.5) / `margin` (0.3)**: Covariance Regularization. It penalizes pairs of selected tokens that are highly correlated. By enforcing a margin of 0.3, it effectively forces the model to select a *diverse* and *non-redundant* set of patches, maximizing the information content transmitted within the 10% budget.
+- **`cov_reg_max_tokens` (64)**: Limits the covariance penalty calculation to a subset of tokens to reduce the $O(N^2)$ computational complexity during training.
+
+### Inference and Semantic Prioritization
+- **`gumbel_mc_enabled` (true)** / **`gumbel_mc_samples` (16)**: During evaluation, the model performs 16 Monte-Carlo stochastic draws. The results are aggregated (strategy: `mean`) to produce a more stable and robust token selection, reducing the impact of random noise in the selection scores during inference.
+- **`semantic_waterfilling` (true)**: Integrates the ViT's internal attention scores into the selection process. It ensures that the most "semantically important" tokens (those with high class-token attention) are prioritized for transmission, especially over the communication channel's limited modes.
+- **`channel_eval_only` (false)**: When false, the compression logic is active and trained end-to-end. If true, compression would only be applied during the validation phase on the communication channel.
 
 ## 4. Data Pipeline and Preprocessing
 The CIFAR-100 dataset is processed using the following transformations:
@@ -53,32 +64,34 @@ The system is trained/validated with the following optimization configuration:
 Model performance is monitored using the accuracy metric. The primary criterion for selecting the "best" model is based on the **average** of the performance recorded (parameter `selection_criterion: average`).
 
 ## 7. Communication Channel Configurations
-The experimental setup supports multiple communication scenarios to evaluate the robustness of the split-model inference under various channel conditions. These are managed via the `CommModuleWrapper` and configured through different profiles:
 
-### 7.1. Clean Profile (Reference)
-Used as a baseline to measure performance without transmission artifacts.
-- **Channel**: Disabled (noise-free transmission).
-- **Bottleneck**: Can be enabled to test the impact of dimensionality reduction alone (e.g., reducing feature dimension to 128).
+The logic for communication and channel simulation is managed through two main configuration profiles, which define the physical layer parameters and the dimensionality reduction techniques applied at the split point.
 
-### 7.2. Noisy Profile (AWGN Simulation)
-Simulates a classic noisy environment using an AWGN (Additive White Gaussian Noise) model.
-- **Setup**: Configured as a 1x1 MIMO system with identity fading.
-- **Bottleneck**: Active, reducing the input dimension (192) to a bottleneck dimension (128).
-- **Training SNR**: Noise is sampled in the range of [0, 20] dB during training to improve robustness.
+### 7.1. MIMO Rayleigh Channel (`baseline_mimo_svd.yaml`)
+This profile simulates a realistic multi-antenna communication environment.
+- **System Dimensions (`n_tx: 4`, `n_rx: 4`)**: A 4x4 MIMO setup allowing up to 4 parallel spatial streams (eigen-modes) for data transmission.
+- **Fading (`rayleigh`)**: Simulates a stochastic, rich-scattering environment. The channel gain matrix is complex-valued and follows a Rayleigh distribution, representing non-line-of-sight propagation.
+- **Equalizer (`mmse`)**: Minimum Mean Square Error equalizer. It attempts to recover the transmitted signal by minimizing both noise and inter-stream interference.
+- **Mode Allocation (`importance_to_modes`)**:
+  - Uses SVD ($H = U\Sigma V^H$) to decompose the channel into independent flat-fading modes.
+  - Features are mapped directly to these modes based on their importance.
+  - **`per_sample: true`**: Recalculates the SVD for every individual sample in the batch, adapting to fast-fading channel fluctuations.
+- **Assignment Logic**:
+  - **`granularity: token`**: Features are assigned to channel modes at the individual token level.
+  - **`prioritize_cls: true`**: Ensures the Class Token is always sent over the strongest available eigen-mode (highest singular value) for maximum reliability.
+- **Power Allocation**: Explicitly disabled (`enabled: false`) for these tests to focus purely on the effectiveness of spatial mode allocation.
+- **Note on Bottleneck**: Mode allocation is automatically disabled in scenarios where only the bottleneck compression is active without token selection.
 
-### 7.3. Diagonal MIMO Profile (Advanced Allocation)
-Tests a 4x4 MIMO setup with fixed channel gains, focusing on importance-aware stream allocation.
-- **Configuration**: 4 Transmitters (TX) and 4 Receivers (RX).
-- **Fading**: Diagonal with fixed gains: `[1.0, 0.8, 0.5, 0.3]`.
-- **Stream Allocation**: Uses the `importance_to_gain` strategy, where data chunks are assigned to specific spatial streams based on their measured importance.
-- **Power Allocation**: Dynamically adjusted based on `selection_scores` to prioritize critical features.
+### 7.2. AWGN-like Channel (`baseline_mimo.yaml`)
+This profile is used as a baseline to simulate standard noisy environments without spatial diversity.
+- **Antenna Config**: Number of antennas is set to **1** (SISO), effectively deactivating spatial multiplexing.
+- **Fading (`identity`)**: Spatiotemporal fading is disabled. The signal only undergoes Additive White Gaussian Noise (AWGN).
+- **Bottleneck Layer**:
+  - **`enabled: true`**: Activates a linear projection at the split point.
+  - **`out_dim: 128`**: Reduces the latent feature vector size from 192 (ViT-Tiny) to 128 dimensions.
+- **Signal Normalization**:
+  - **`normalize: true`**: Ensures the transmitted signal has unit average power.
+  - **`normalization_mode: sample`**: Normalization is performed on a per-sample basis.
+- **Training SNR (`snr_db: [0, 20]`)**: Noise levels are randomly sampled between 0 and 20 dB during training, forcing the model to learn noise-resilient features.
+- **Evaluation SNR (`snr_sweep: [-5, 0, 10, 20]`)**: Standard set of noise levels used during validation to characterize performance degradation under adverse conditions.
 
-### 7.4. SVD MIMO Profile (Fading Robustness)
-Evaluates performance over a realistic Rayleigh fading channel using Singular Value Decomposition (SVD).
-- **Configuration**: 4x4 MIMO setup.
-- **Fading**: Rayleigh (stochastic fading).
-- **Mode Allocation**: Uses the `importance_to_modes` strategy. It decomposes the channel matrix using SVD and maps the most important tokens to the strongest eigen-modes of the channel.
-- **Equalizer**: MMSE (Minimum Mean Square Error) is used for signal recovery.
-
-### 7.5. Evaluation Sweep
-Across all noisy scenarios, the model is evaluated over a wide Signal-to-Noise Ratio (SNR) sweep, typically including **-5, 0, 5, 10, and 20 dB**, to characterize the performance degradation under increasingly adverse conditions.
