@@ -212,7 +212,19 @@ Then, the measured post-equalization SNR for each scenario is shown.
 
 ---
 
-## 5. Results Folder Naming (Current)
+## 5. Trade off between SNR and Accuracy and between the type of compression and the accuracy
+
+The plots below show the trade off that appair between the SNR and the accuracy:
+
+![Trade off between SNR and Accuracy](../Plots/baseline/plt7.png)
+
+And also the trade off between the type of compression and the accuracy.
+
+![Trade off between Compression and Accuracy](../Plots/baseline/plt8.png)
+
+---
+
+## 6. Results Folder Naming (Current)
 
 - S1_CLEAN -> `results/S1_CLEAN/`
 - S2_MIS_AWGN -> `results/S2_MIS_AWGN/`

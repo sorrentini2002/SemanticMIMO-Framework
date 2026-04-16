@@ -385,12 +385,16 @@ def main(cfg):
             num_workers=num_workers,
         )
 
+        # Auto-compute total steps for Gumbel annealing before method init.
+        total_steps = num_epochs * len(train_dataloader)
+        if OmegaConf.select(cfg, "method.parameters.steps") is not None:
+            cfg.method.parameters.steps = total_steps
+
         # Get model
         model = hydra.utils.instantiate(cfg.model)
 
         # Get channel
         channel = hydra.utils.instantiate(cfg.communication.channel)
-
 
         # Apply method to the model
         model = hydra.utils.instantiate(cfg.method.model,
@@ -403,6 +407,9 @@ def main(cfg):
 
         # Print model, dataset and method
         print(f"\n\nTraining seed {seed}: \n\n  --model: {cfg.model.model_name} \n  --dataset: {cfg.dataset.name} \n  --communication: {cfg.communication.name} \n  --method: {cfg.method.name} \n  --compression: {model.compression_ratio} \n")
+
+        if OmegaConf.select(cfg, "method.parameters.steps") is not None:
+            print(f"Auto-computed Annealing Steps: {total_steps}")
         print(f"\n\nParameters:  {cfg.method.parameters}\n\n  ")
         
         # Get the current Hydra output directory

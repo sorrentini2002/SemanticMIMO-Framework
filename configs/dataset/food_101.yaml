@@ -42,4 +42,8 @@ test:
 name : food-101
 num_classes : 101 
 batch_size : 128
-num_epochs: 10
+num_epochs: 15
+num_workers: 2
+
+selection_criterion: average 
+selection_snr_index: 0 

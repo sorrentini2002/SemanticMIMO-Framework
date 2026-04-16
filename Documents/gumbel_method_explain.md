@@ -4,17 +4,67 @@
 
 ## General Overview
 
-`gumbel_method.py` implements a split-learning wrapper for ViT/DeiT models based on
-**Gumbel-Softmax token selection**. 
+`gumbel_method.py` implements a split-learning wrapper for ViT/DeiT models based on **Gumbel-Softmax token selection**. 
 
-Unlike previous iterations, this module now follows a **"Native Wrapper"** design: it does not implement the compression algorithm itself but imports it directly from the core `methods/gumbel/` directory. This ensures 100% algorithmic fidelity with the pristine Gumbel implementation while providing the necessary integration hooks for the SemanticMIMO framework.
+This module acts as a bridge between the Vision Transformer backbone and the SemanticMIMO communication channel, ensuring that token selection is not only efficient but also mathematically sound for gradient-based training and robust under physical channel noise.
 
 Main objectives of the module:
 
-1. Select the most relevant patch tokens using the core Gumbel-Softmax algorithm.
-2. Maintain a drop-in replacement interface for the SemanticMIMO pipeline.
-3. Expose per-token semantic scores (`last_adc_scores`) to the communication channel for adaptive resource allocation.
-4. Support dynamic "Clean Validation" and evaluation-only channel toggling.
+1. **Top-K Selection**: Select the most relevant patch tokens using Gumbel-Softmax for differentiable pruning.
+2. **Gradient Integrity**: Use the Straight-Through Estimator (STE) to maintain gradient flow from the classification loss to the selection module.
+3. **Logits-Domain Sampling**: Sample directly from attention logits to prevent noise-dominance issues associated with probability-domain (post-softmax) sampling.
+4. **MIMO Semantic Scaling**: Expose normalized semantic scores (`last_adc_scores`) to the channel module to guide adaptive power allocation (Waterfilling).
+5. **Energy Preservation Under Compression**: Rescale selected tokens before channel transmission so the average transmitted energy remains consistent when only a small Top-K subset is sent.
+6. **Warmup-Aware Training**: Keep full-token transmission during early optimization steps so the ViT backbone stabilizes before enabling token pruning.
+7. **Diversity Enforcement**: Apply entropy and covariance regularization to prevent mode collapse and encourage diverse token selection.
+
+---
+
+## Technical Architecture
+
+### 1. Logits Extraction and Stable Sampling
+To ensure Gumbel noise is properly scaled, the module bypasses the standard attention softmax and captures raw Dot-Product logits. The `Store_Class_Token_Attn_Wrapper` intercedes during the attention forward pass:
+```python
+attn_logits = q @ k.transpose(-2, -1)
+# Captured for Gumbel sampling:
+self.class_token_logits = attn_logits[:, :, 0, :].mean(dim=1) 
+# Standard ViT continues:
+attn = attn_logits.softmax(dim=-1)
+```
+When scores are already in probability-like range `[0, 1]`, they are converted to logits with `log(clamp(scores, min=1e-10))` before adding Gumbel noise. This prevents random-selection behavior caused by adding high-variance Gumbel perturbations directly to bounded probabilities.
+
+### 2. Standardized Semantic Scores (`last_adc_scores`)
+For the physical MIMO channel (SVD/Waterfilling), it is critical that the **CLS token (index 0)** receives the highest possible power allocation. 
+- **The Issue**: Raw Gumbel logits are unbounded. If used directly, a logit of `10.0` for a patch would make the dummy CLS score of `1.0` look "weak" to the power allocator.
+- **The Solution**: Scores are passed through a `sigmoid` function before export. This ensures all semantic weights are in the range `(0, 1]`, making the CLS dummy value of `1.0` the absolute power priority.
+
+### 3. Gradient Flow (Straight-Through Estimator)
+The selection uses a "Hard" Top-K mask in the forward pass for maximum compression utility, but remains differentiable in the backward pass via the STE identity:
+$$m_{final} = m_{hard} + (n_{\alpha} \cdot m_{soft} - (n_{\alpha} \cdot m_{soft}).detach())$$
+This allows the classification loss to "vote" on which patches are semantically important for the task.
+
+The scaling factor $n_{\alpha}$ matches the gradient magnitude to the Top-K hard selection budget, avoiding weak gradients when soft probabilities sum to 1 but hard selection activates multiple tokens.
+
+### 4. Channel-Consistent Backpropagation and Energy Normalization
+The channel path has been aligned with physically consistent training dynamics:
+
+- In the AWGN analog channel, noise is applied in forward only; gradient-time noise injection has been removed to preserve STE learning signal.
+- In `gumbel_compress`, selected tokens are scaled by $\sqrt{N / N_{sel}}$ before transmission so compression does not collapse effective per-token SNR when only a small subset is sent.
+
+Together, these changes prevent gradient destruction and stabilize optimization under noisy channels.
+
+---
+
+## Regularization Mechanisms
+
+To ensure stable training, the wrapper implements two key regularization losses:
+
+| Loss Type | Logic | Purpose |
+| :--- | :--- | :--- |
+| **Global Entropy** | Minimizes $- \sum \bar{p} \log \bar{p}$ over the batch mean probability $\bar{p}$. | Prevents **Mode Collapse**. Ensures the model explores different patches across the dataset. |
+| **Covariance** | Penalizes cosine similarity between full patch embeddings, weighted by selection probability. | Promotes **Feature Diversity**. Encourages the model to pick complementary tokens rather than redundant ones. |
+
+In addition, warmup and annealing are synchronized so temperature decay starts only after warmup, and annealing length is aligned with total training steps ($epochs \times steps\_per\_epoch$).
 
 ---
 
@@ -23,149 +73,35 @@ Main objectives of the module:
 ```
 gumbel_method.py
 |
-|-- IMPORTS
-|    |-- sample_gumbel_topk()          # From .gumbel.gumbel
-|    `-- compute_tau()                 # From .gumbel.schedules
+|-- Store_Class_Token_Attn_Wrapper     # Captures raw logits and attn scores.
 |
 |-- Gumbel_Token_Selection_Block_Wrapper
-|    |-- register_step()
-|    |-- current_tau (property)
-|    |-- gumbel_compress()
-|    |-- forward()                     # Forward + Clean Bypass check
-|    `-- compress_labels()              # Dummy wrapper (K-means removed)
+|    |-- gumbel_compress()             # Main selection logic + MIMO normalization.
+|    |-- compute_reg_loss()            # Entropy & Covariance implementation.
+|    `-- forward()                     # Residual pass + warmup/clean-bypass gating.
 |
-|-- Store_Class_Token_Attn_Wrapper     # Stores CLS attention row [B, N]
-|
-`-- model                              # Outer split-learning model wrapper
-	  |-- __init__()
-	  |-- build_model()
-	  `-- forward()
+`-- model                              # Split-Learning assembler.
 ```
-
----
-
-## Imports and Dependencies
-
-```python
-from .gumbel.gumbel import sample_gumbel_topk
-from .gumbel.schedules import compute_tau
-from comm.comm_module_wrapper import CommModuleWrapper
-```
-
-### Key dependencies
-
-- **`methods.gumbel`**: The source of truth for the Gumbel-Softmax algorithm.
-- **`timm`**: Used for the Vision Transformer backbone.
-- **`CommModuleWrapper`**: Advanced communication wrapper with semantic score support.
-
----
-
-## Core Algorithm Integration
-
-The module no longer defines the mathematical logic for selection. Instead, it delegates to:
-
-1. **`compute_tau`**: Handles the annealing schedule (linear, cosine, exp) of the Gumbel temperature.
-2. **`sample_gumbel_topk`**: Handles Gumbel noise sampling, Straight-Through Estimator (STE) masks, and token gathering.
-
-This ensures that any improvement to the core Gumbel logic is automatically reflected in the MIMO pipeline.
-
----
-
-## Class `Gumbel_Token_Selection_Block_Wrapper`
-
-This class wraps one transformer block and applies token compression using the core Gumbel logic.
-
-### Interface-critical attributes
-
-- `last_adc_scores`: `[B, N_selected]` semantic scores consumed by `CommModuleWrapper` for waterfilling.
-- `_model_ref`: weak back-reference to parent model, used to read the `clean_validation` flag.
-- `n_new_tokens`: tracks the current sequence length after compression (CLS + K patches).
-
----
-
-## Constructor (`__init__`)
-
-### Parameters
-
-- `token_compression`: patch retention ratio (e.g., 0.5 to keep half the patches).
-- `tau_max`, `tau_min`, `anneal_steps`, `anneal_mode`: temperature annealing hyper-parameters.
-- `hard`, `straight_through`: flags for the STE gradient estimator.
-- `compression_enabled`: master toggle to bypass compression entirely.
-
----
-
-## `gumbel_compress(x)`
-
-The bridge between the ViT features and the Gumbel core.
-
-### Steps
-
-1. **Attention Extraction**: Retrieves the CLS attention scores stored by `Store_Class_Token_Attn_Wrapper`.
-2. **Shape Alignment**: Unsqueezes the attention to `[B, 1, N]` to meet the internal expectations of the core algorithm.
-3. **Core Call**: Executes `sample_gumbel_topk`.
-4. **Score Export**: Gather the raw importance scores for the *selected* tokens and prepends a `1.0` dummy score for the CLS token, storing the result in `self.last_adc_scores`.
-
----
-
-## `forward(x)`
-
-Implements the phase-aware forward pass.
-
-1. **Standard block pass**: Residual attention and MLP.
-2. **Bypass Check**: If `self.training` is False and `clean_validation` is enabled, it returns the full token sequence.
-3. **Compression**: If active, calls `gumbel_compress`.
-
----
-
-## `compress_labels(labels, num_classes)`
-
-Since batch compression (K-Means) has been removed to prioritize Gumbel algorithmic purity, this function now simply returns standard one-hot encoded labels:
-`F.one_hot(labels, num_classes=num_classes).float()`.
-
----
-
-## Class `model` (Outer Wrapper)
-
-Top-level integration class that assembles the split-learning pipeline.
-
-### Constructor & build_model()
-
-- **Split Index**: Injects the compressor and channel at the specified block index.
-- **Semantic Wiring**: Automatically links the compressor's `last_adc_scores` to the `CommModuleWrapper`.
-- **Logic Toggle**: Forward the `semantic_waterfilling` and `channel_eval_only` flags to the communication module.
 
 ---
 
 ## End-to-End Execution Flow
 
-```
-Input image batch
-	 |
-	 v
-ViT blocks before split
-	 |
-	 v
-Wrapped split block
-	 |-- attention wrapper stores CLS values
-	 |-- Gumbel logic samples top patches based on CLS scores
-	 |-- last_adc_scores populated for waterfilling
-	 v
-CommModuleWrapper channel
-	 |-- reads scores from Gumbel output
-	 |-- applies SNR/Mode allocation (Semantic Waterfilling)
-	 v
-ViT blocks after split
-	 v
-Classifier output
-```
+1. **Client Blocks**: Initial transformer layers process the image.
+2. **Split Point (Wrapper)**:
+    - **Capture**: Raw attention logits are stored.
+    - **Sample**: Gumbel-Softmax selects Top-K patches.
+    - **Scale**: Selected scores are sigmoided for MIMO-ready `last_adc_scores`; selected token embeddings are energy-normalized before channel transmission.
+    - **Warmup Control**: Before `warmup_steps`, compression is bypassed and the full token sequence is forwarded.
+3. **Channel (`CommModuleWrapper`)**: 
+    - Performs SVD-based communication using semantic scores to allocate power/modes, while AWGN noise is injected only in the forward signal path.
+4. **Server Blocks**: The decoder layers process the received (and noisy) tokens to perform final classification.
 
 ---
 
-## Final Summary
+## Evaluation Modes
 
-The current architecture of `gumbel_method.py` prioritizes **separation of concerns**:
-- **Math/Algorithm**: Isolated in `methods/gumbel/`.
-- **System Integration**: Managed by `gumbel_method.py`.
-- **MIMO Physics**: Managed by `comm_module.py`.
+- **MC-Evaluation**: When enabled, the model aggregates weights over multiple Gumbel noise samples to produce a robust, deterministic ranking for testing.
+- **Clean Validation**: A diagnostic mode that bypasses all selection and channel noise to establish a noise-free performance ceiling.
 
-By removing the legacy K-means logic, we focus exclusively on the impact of Gumbel-Softmax token pruning in MIMO scenarios, providing a cleaner baseline for comparison against the original "proposal" method.
+Default configuration has been aligned with these dynamics (`tau_start: 1.0`, `warmup_steps: 1000`) in both Gumbel method configurations, including the eval-channel profile.

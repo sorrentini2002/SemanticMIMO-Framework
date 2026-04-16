@@ -108,6 +108,9 @@ class Gumbel_Token_Selection_Block_Wrapper(nn.Module):
         self.gumbel_mc_tau = method_cfg.get('gumbel_mc_tau', 0.5)
         self.gumbel_mc_samples = method_cfg.get('gumbel_mc_samples', 16)
         self.gumbel_mc_aggregate = method_cfg.get('gumbel_mc_aggregate', 'mean')
+        
+        # Warmup strategy
+        self.warmup_steps = method_cfg.get('warmup_steps', 1000)
         # Costruisce dizionario dinamico per eventuali metodi Diversify
         self.diversify_cfg = {
             'enabled': method_cfg.get('diversify_enabled', False),
@@ -122,6 +125,7 @@ class Gumbel_Token_Selection_Block_Wrapper(nn.Module):
         # Intermediates for regularization loss (populated during gumbel_compress)
         self._last_patch_scores = None   # [B, num_patches] soft probabilities
         self._last_tokens_sel = None     # [B, 1+n_alpha, D] selected tokens
+        self._last_full_patches = None   # [B, num_patches, D] full patch embeddings for covariance reg
 
     # ------------------------------------------------------------------
     # Step management
@@ -134,8 +138,13 @@ class Gumbel_Token_Selection_Block_Wrapper(nn.Module):
     @property
     def current_tau(self) -> float:
         """Current Gumbel-Softmax temperature based on the annealing schedule."""
+        # Annealing only starts after warmup
+        if self._global_step < self.warmup_steps:
+            return self.tau_max
+            
+        effective_step = self._global_step - self.warmup_steps
         return compute_tau(
-            self._global_step,
+            effective_step,
             self.tau_max,
             self.tau_min,
             self.anneal_steps,
@@ -170,6 +179,9 @@ class Gumbel_Token_Selection_Block_Wrapper(nn.Module):
         num_patches = N - 1
         device = x.device
 
+        if self.training:
+            self._last_full_patches = x[:, 1:, :]
+
         # ---- Determine number of patch tokens to keep ----
         # Bug 5 fix: use eval_k at inference time if configured
         if not self.training and self.eval_k is not None:
@@ -178,15 +190,20 @@ class Gumbel_Token_Selection_Block_Wrapper(nn.Module):
             n_alpha = max(1, int(self.token_compression * num_patches))
         self.n_new_tokens = 1 + n_alpha  # CLS + selected patches
 
-        # ---- Retrieve CLS-row attention scores [B, N] ----
-        cls_attn = self.block.attn.class_token_attention  # [B, N]
-
+        # ---- Retrieve CLS-row attention LOGITS [B, N] ----
+        # Using raw logits before softmax ensures Gumbel sampling runs in logits space.
+        if hasattr(self.block.attn, 'class_token_logits') and self.block.attn.class_token_logits is not None:
+            cls_attn = self.block.attn.class_token_logits
+        else:
+            # Fallback path: convert probabilities to logits to keep train/eval consistent.
+            cls_attn = torch.log(self.block.attn.class_token_attention.clamp(min=1e-10))
+            
         # ---- Bug 4 fix: MC-averaged eval vs Gumbel train ----
         if not self.training and self.gumbel_mc_enabled:
             # MC-averaged deterministic top-k for robust evaluation
             patch_scores_raw = cls_attn[:, 1:]  # [B, num_patches]
 
-            # Compute MC-averaged probabilities
+            # Compute MC-averaged probabilities (outputs probabilities!)
             patch_scores = compute_gumbel_mc_scores(
                 patch_scores_raw,
                 num_samples=self.gumbel_mc_samples,
@@ -207,11 +224,10 @@ class Gumbel_Token_Selection_Block_Wrapper(nn.Module):
             tokens_sel = gather_tokens(x, indices_sel)
 
             # Selected patch scores for MIMO waterfilling
-            # Re-order relative indices to match sorted global order
             topk_relative_sorted = torch.gather(
                 topk_relative_indices, 1, sort_order
             )
-            selected_patch_scores = torch.gather(
+            selected_patch_probs = torch.gather(
                 patch_scores, 1, topk_relative_sorted
             )
         else:
@@ -233,19 +249,28 @@ class Gumbel_Token_Selection_Block_Wrapper(nn.Module):
             self._last_patch_scores = patch_scores
             self._last_tokens_sel = tokens_sel
 
-            # Selected patch scores
+            # Selected patch scores (these are UNNORMALIZED LOGITS)
             selected_patch_indices = indices_sel[:, 1:] - 1  # [B, n_alpha], 0-based
-            selected_patch_scores = torch.gather(
+            selected_patch_logits = torch.gather(
                 patch_scores, 1, selected_patch_indices
             )
+            # Normalize to probabilities [0, 1] for the MIMO channel
+            selected_patch_probs = torch.sigmoid(selected_patch_logits / tau)
 
         # ---- Build last_adc_scores for MIMO waterfilling ----
+        # Using probs ensures cls_dummy=1.0 is always the maximum power token!
         cls_dummy = torch.ones(
-            (B, 1), dtype=selected_patch_scores.dtype, device=device
+            (B, 1), dtype=selected_patch_probs.dtype, device=device
         )
         self.last_adc_scores = torch.cat(
-            [cls_dummy, selected_patch_scores], dim=1
+            [cls_dummy, selected_patch_probs], dim=1
         )  # [B, 1 + n_alpha]
+
+        # Bug 4 Fix: Energy Normalization
+        # Scale selected tokens to preserve the total average energy of the original signal
+        # Since we transmit fewer tokens, we can boost their power
+        scale_factor = math.sqrt(N / self.n_new_tokens)
+        tokens_sel = tokens_sel * scale_factor
 
         return tokens_sel
 
@@ -267,50 +292,52 @@ class Gumbel_Token_Selection_Block_Wrapper(nn.Module):
 
         device = self._last_patch_scores.device
         reg_loss = torch.tensor(0.0, device=device)
+        
+        # Soft selection probabilities (same approach as original Scardapane code)
+        tau = self.current_tau
+        p = torch.sigmoid(self._last_patch_scores / tau)  # [B, num_patches]
 
         # ---- Entropy regularization ----
-        # Encourages sharper (less uniform) attention distributions.
-        # Lower entropy → model is more confident about which tokens matter.
+        # In the original code, this minimizes negative entropy over the mean batch
+        # prob, effectively maximizing the global entropy and preventing mode collapse.
         if self.entropy_reg_enabled:
-            p = self._last_patch_scores  # [B, num_patches]
-            # Normalize to form a proper distribution
-            p = p / (p.sum(dim=-1, keepdim=True) + 1e-8)
-            entropy = -(p * torch.log(p + 1e-8)).sum(dim=-1)  # [B]
-            reg_loss = reg_loss + self.entropy_reg_weight * entropy.mean()
+            p_mean = p.mean(dim=0)  # [num_patches] marginal probability
+            ent_reg = -torch.sum(p_mean * torch.log(p_mean + 1e-8))
+            reg_loss = reg_loss + self.entropy_reg_weight * ent_reg
 
         # ---- Covariance regularization ----
-        # Penalizes high correlation among selected token features,
-        # encouraging the model to pick diverse/complementary tokens.
-        if self.cov_reg_enabled and self._last_tokens_sel is not None:
-            sel = self._last_tokens_sel  # [B, 1+n_alpha, D]
-            # Exclude CLS token, work on patch tokens only
-            patch_features = sel[:, 1:]  # [B, n_alpha, D]
-
+        # Penalizes high correlation among ALL tokens based on their probability of being selected.
+        if self.cov_reg_enabled and self._last_full_patches is not None:
+            patch_embeds = self._last_full_patches  # [B, num_patches, D]
+            B_size, N_minus_1, D = patch_embeds.shape
+            
+            p_sub = p
+            
             # Subsample if too many tokens (memory)
-            if patch_features.shape[1] > self.cov_reg_max_tokens:
-                idx = torch.randperm(
-                    patch_features.shape[1], device=device
-                )[:self.cov_reg_max_tokens]
-                patch_features = patch_features[:, idx]
+            if N_minus_1 > self.cov_reg_max_tokens:
+                idx = torch.randperm(N_minus_1, device=device)[:self.cov_reg_max_tokens]
+                patch_embeds = patch_embeds[:, idx, :]
+                p_sub = p[:, idx]
 
-            # Center features
-            patch_features = patch_features - patch_features.mean(
-                dim=1, keepdim=True
-            )
-
-            # Compute cosine similarity matrix [B, n, n]
-            norms = patch_features.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-            patch_normed = patch_features / norms
-            sim = torch.bmm(
-                patch_normed, patch_normed.transpose(1, 2)
-            )  # [B, n, n]
-
-            # Off-diagonal penalty: penalize similarities above margin
-            n = sim.shape[1]
-            mask = ~torch.eye(n, dtype=torch.bool, device=device).unsqueeze(0)
-            off_diag = sim[mask].view(sim.shape[0], -1)  # [B, n*(n-1)]
-            penalty = F.relu(off_diag.abs() - self.cov_reg_margin)
-            reg_loss = reg_loss + self.cov_reg_weight * penalty.mean()
+            # Normalize embeddings for cosine similarity
+            patch_embeds_norm = torch.nn.functional.normalize(patch_embeds, p=2, dim=-1)
+            
+            # Compute similarity matrix [B, S, S]
+            sim_matrix = torch.bmm(patch_embeds_norm, patch_embeds_norm.transpose(1, 2))
+            
+            # Mask out diagonal (self-similarity)
+            eye = torch.eye(sim_matrix.shape[-1], device=device).unsqueeze(0).expand(B_size, -1, -1)
+            sim_matrix = sim_matrix * (1.0 - eye)
+            
+            # Apply margin max(0, cos - margin)
+            penalty = torch.clamp(sim_matrix - self.cov_reg_margin, min=0.0)
+            
+            # Weight by soft-selection probs: w_i * w_j * penalty
+            w = p_sub / (p_sub.sum(dim=-1, keepdim=True) + 1e-8)  # normalized weights
+            w_matrix = torch.bmm(w.unsqueeze(-1), w.unsqueeze(1))  # [B, S, S]
+            
+            cov_loss_batch = torch.sum(w_matrix * penalty, dim=(1, 2))
+            reg_loss = reg_loss + self.cov_reg_weight * cov_loss_batch.mean()
 
         return reg_loss
 
@@ -347,11 +374,12 @@ class Gumbel_Token_Selection_Block_Wrapper(nn.Module):
         if not self.training and self._model_ref is not None:
             clean_val = getattr(self._model_ref, 'clean_validation', False)
 
-        if self.compression_enabled and not clean_val:
+        # Apply compression only if warmup is over
+        if self.compression_enabled and not clean_val and self._global_step >= self.warmup_steps:
             # Apply Gumbel token compression
             x = self.gumbel_compress(x)
 
-        # If clean_val is True or compression_enabled is False, x passes through unmodified (no compression)
+        # If clean_val is True, compression_enabled is False, or warmup is active, x passes through unmodified (no compression)
         return x
 
     # ------------------------------------------------------------------
@@ -392,6 +420,7 @@ class Store_Class_Token_Attn_Wrapper(nn.Module):
         super().__init__()
         self.attn = attn
         self.class_token_attention = None
+        self.class_token_logits = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, N, C = x.shape
@@ -405,8 +434,12 @@ class Store_Class_Token_Attn_Wrapper(nn.Module):
 
         # Scaled dot-product
         q = q * self.attn.scale
-        attn = q @ k.transpose(-2, -1)
-        attn = attn.softmax(dim=-1)
+        attn_logits = q @ k.transpose(-2, -1)
+        
+        # Store pre-softmax CLS-row logits averaged across heads → [B, N]
+        self.class_token_logits = attn_logits[:, :, 0, :].mean(dim=1)
+
+        attn = attn_logits.softmax(dim=-1)
 
         # Store CLS-row attention averaged across heads  →  [B, N]
         self.class_token_attention = attn[:, :, 0, :].mean(dim=1)
