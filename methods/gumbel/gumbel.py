@@ -32,9 +32,8 @@ def compute_gumbel_mc_scores(scores, num_samples=16, tau=0.5, aggregate="mean", 
     # Broadcast scores to [num_samples, B, num_patches]
     scores_expanded = scores.unsqueeze(0).expand(num_samples, -1, -1)
     
-    # Canonical Gumbel-Softmax: softmax((logits + gumbel) / tau)
-    tau = max(float(tau), 1e-6)
-    noisy_scores = scores_expanded + gumbel_noise
+    # Softmax over perturbed scores
+    noisy_scores = scores_expanded + gumbel_noise * tau
     p_soft = F.softmax(noisy_scores / tau, dim=-1)
     
     # Aggregate
@@ -50,7 +49,7 @@ def sample_gumbel_from_scores(scores, n_alpha, tau=1.0, hard=True, straight_thro
     Perform Gumbel-Softmax sampling on given scores.
     
     Args:
-        scores: [B, N-1] - Logits for patch tokens.
+        scores: [B, N-1] - Unnormalized log-probabilities (or scores) for patch tokens.
         n_alpha: int - Number of tokens to select.
         tau: float - Gumbel temperature.
         hard: bool - Hard selection.
@@ -73,12 +72,14 @@ def sample_gumbel_from_scores(scores, n_alpha, tau=1.0, hard=True, straight_thro
          
     gumbel_noise = -torch.log(-torch.log(u + eps) + eps)
     
-    # 2. Add noise in logits space
-    tau = max(float(tau), 1e-6)
-    noisy_scores = scores + gumbel_noise
+    # 2. Add noise
+    # We apply noise scaled by tau (Noise Annealing) so that:
+    # - tau -> 0: Noise vanishes, selection becomes deterministic argmax(scores).
+    # - tau -> inf: Noise dominates, selection becomes uniform.
+    noisy_scores = scores + gumbel_noise * tau
     
     # 3. Soft Probabilities
-    # m_soft approximates softmax((scores + gumbel) / tau)
+    # m_soft approx softmax(scores/tau + g)
     m_soft = F.softmax(noisy_scores / tau, dim=-1)
     
     # 4. Hard Selection
@@ -89,7 +90,7 @@ def sample_gumbel_from_scores(scores, n_alpha, tau=1.0, hard=True, straight_thro
     if straight_through:
         m_hard = torch.zeros_like(scores)
         m_hard.scatter_(1, topk_relative_indices, 1.0)
-        m = m_hard + (m_soft * n_alpha - (m_soft * n_alpha).detach())
+        m = m_hard + (m_soft - m_soft.detach())
         
     return topk_relative_indices, m, tau
 

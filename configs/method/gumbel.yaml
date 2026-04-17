@@ -10,13 +10,12 @@ parameters:
   semantic_waterfilling: true
   
   # --- GUMBEL CORE ---
-  tau_start: 1.0
+  tau_start: 2.0
   tau_end: 0.1
   schedule: linear
   steps: 10000
   hard: true
   straight_through: true
-  warmup_steps: 1000
   
   # --- LOSS / REGULARIZATION (Algoritmico) ---
   entropy_reg_enabled: true
@@ -28,7 +27,7 @@ parameters:
   cov_reg_max_tokens: 64
   
   # --- FASE DI VALUTAZIONE / INFERENZA ---
-  eval_k: null
+  eval_k: 32
   gumbel_mc_enabled: true
   gumbel_mc_samples: 16
   gumbel_mc_tau: 0.5

@@ -224,7 +224,15 @@ And also the trade off between the type of compression and the accuracy.
 
 ---
 
-## 6. Results Folder Naming (Current)
+## 6. Comparison between the Gumbel method and the Random method
+
+The plots below show the comparison between the Gumbel method and the Random method in terms of accuracy and SNR. We have tested the Random method with and without Waterfilling and with the same compression ratio of the Gumbel method.
+
+![Comparison between Gumbel and Random methods](../Plots/baseline/plt9.png)
+
+---
+
+## 7. Results Folder Naming (Current)
 
 - S1_CLEAN -> `results/S1_CLEAN/`
 - S2_MIS_AWGN -> `results/S2_MIS_AWGN/`

@@ -40,6 +40,15 @@ class Gaussian_Noise_Analogic_Channel(nn.Module):
         if self.training:
             input = self.add_awgn_noise(input)
 
+        # Simple backward noise hook 
+        def _grad_hook(grad):
+            grad = self.add_awgn_noise(grad)
+            return grad
+            
+        # Register hook
+        if input.requires_grad:
+            input.register_hook(_grad_hook)
+
         return input
 
 # Class that imitates substitutes encoder, decoder and channel (when setting is_channel = True) 
