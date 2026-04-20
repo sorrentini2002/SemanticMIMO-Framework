@@ -169,3 +169,51 @@ The current architecture of `gumbel_method.py` prioritizes **separation of conce
 - **MIMO Physics**: Managed by `comm_module.py`.
 
 By removing the legacy K-means logic, we focus exclusively on the impact of Gumbel-Softmax token pruning in MIMO scenarios, providing a cleaner baseline for comparison against the original "proposal" method.
+
+
+---
+
+### Technical Implementation Details and Code Modifications
+
+The following updates have been implemented to stabilize the training of the Gumbel-Softmax token selection policy and ensure optimal gradient flow through the end-to-end communication pipeline.
+
+### 1. Dynamic SNR Training (main.py)
+To prevent the model from collapsing under constant high-noise conditions during training, we implemented **Dynamic SNR Sampling**. 
+- For every batch, the training SNR is sampled uniformly from the interval `[0.0, 20.0]` dB.
+- High-SNR batches act as "beacons" for the gradient, allowing the ViT backbone to receive clear semantic feedback through the Straight-Through Estimator (STE) without the signal being entirely masked by channel noise.
+
+### 2. "The Cage": Native Attention Scoring (gumbel_method.py)
+The dedicated MLP-based scoring head (linear layers + GELU) has been removed. 
+- Scores are now derived directly from the native `class_token_attention` of the wrapped ViT block.
+- Because these scores originate from the transformer's own Softmax layer, they are mathematically bounded within the `[0, 1]` range. This eliminates the risk of logit "explosions" and stabilizes the Gumbel sampling process without requiring ad-hoc clipping hacks.
+
+### 3. Gumbel-Softmax Overhaul (gumbel.py)
+We have refined the stochastic selection logic to better align with the linear nature of attention weights:
+- **Removal of Logarithm**: The formula `torch.log(scores)` was removed. Noisy logits are now computed as `scores + (gumbel_noise * tau)`.
+- **Decaying Noise Amplitude**: The physical magnitude of the Gumbel noise now scales with the temperature `tau`. As training progresses and `tau` decreases, the perturbation fades, allowing the model to solidify its selection policy.
+- **Double Softmax (Exponential Amplification)**: To exaggerate micro-differences in attention weights and force discrete selection, we use `F.softmax(noisy_scores / tau, dim=-1)`.
+
+### 4. Batch Entropy Regularization (gumbel_method.py & main.py)
+To ensure spatial diversity and prevent the "Index Collapse" (where the model always selects the same patch locations regardless of image content), we introduced an **Active Entropy Loss**:
+- We calculate the **mean selection distribution** across the entire batch (`p_mean`).
+- We maximize the entropy of this mean distribution by subtracting it from the total training loss (with a weighting factor of `0.05`). 
+- This forces the model to explore different regions of the image across the dataset while still allowing it to be sharp and selective for any individual image.
+
+### 5. Fixed Temperature Annealing (main.py)
+A critical logic bug was resolved by hooking the `register_step()` method directly into the training loop. 
+- The Gumbel temperature `tau` now correctly decays from the starting value (2.0) to the target value (0.1). 
+- Without this fix, the selection remained stochastic/random forever, preventing the convergence to a hard, semantically-driven policy.
+
+### 6. Gradient Flow Optimization (communication.py & mimo.py)
+To maintain the integrity of the "gradient thread" from the final loss back to the Client-side ViT, several `.detach()` calls were removed:
+- **Channel Power Tracking**: Removed `.detach()` from the signal power and noise variance calculations. The gradient now understands how the power allocation strategy (including Waterfilling) affects the effective SNR.
+- **Attention Flow**: Removed `.detach()` from `class_token_attention`, enabling the ViT to learn which tokens are semantically relevant for the task through the Straight-Through Estimator.
+
+### 7. Removal of Gradient Noise Hooks (communication.py)
+Experimental hooks that injected AWGN noise into the **backward pass** (gradients) have been removed. We determined that noise should only affect the forward pass (the data), while the backward pass must stay as clean as possible to provide high-fidelity optimization signals to the scoring mechanism.
+
+### 8. Removal of Spatial Reconstruction (comm_module_wrapper.py)
+The zero-padding reconstruction previously performed at the Server-side has been removed. 
+- The Server now processes the condensed feature set directly. 
+- This prevents the model from learning "fake" geometric cues from the absolute zeros used in padding, which was previously causing instabilities in the Server's LayerNorm and Self-Attention layers.
+

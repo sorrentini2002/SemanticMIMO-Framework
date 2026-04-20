@@ -1,0 +1,20 @@
+model:
+  _target_: methods.random_SP.model
+  method_cfg: ${method.parameters}
+name: random_SP
+parameters:
+  desired_compression: 0.1
+  token_compression: null
+  compression_enabled: true
+  channel_eval_only: false
+  semantic_waterfilling: true
+  eval_k: null
+
+  # Random_SP specific parameters
+  diversify:
+    enabled: false
+    lambda: 0.2
+    metric: "cosine"  # "cosine" or "l2"
+  
+  # Number of tokens to keep based on CLS attention
+  keep_cls_neighbors: 0

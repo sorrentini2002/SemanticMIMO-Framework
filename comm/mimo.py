@@ -411,7 +411,7 @@ class MIMOAWGNChannel(nn.Module):
             sigma2_vec = torch.zeros((bsz,), device=device, dtype=dtype)
         else:
             p_received = torch.mean(
-                y_signal.detach().reshape(bsz, -1) ** 2, dim=1, keepdim=True,
+                y_signal.reshape(bsz, -1) ** 2, dim=1, keepdim=True,
             )  # [B, 1]
             sigma2_vec = (p_received.view(-1) / snr_linear).to(dtype=dtype)
 

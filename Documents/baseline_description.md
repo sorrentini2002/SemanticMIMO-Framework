@@ -245,3 +245,5 @@ The plots below show the comparison between the Gumbel method and the Random met
 - S5_ROB_MIMO_S -> `results/S5_ROB_MIMO_S/`
 - S6_ROB_AWGN_BS -> `results/S6_ROB_AWGN_BS/`
 - S6_ROB_MIMO_BS -> `results/S6_ROB_MIMO_BS/`
+
+

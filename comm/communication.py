@@ -26,7 +26,7 @@ class Gaussian_Noise_Analogic_Channel(nn.Module):
 
         # Compute noise power for the desired SNR
         noise_power = signal_power / (10 ** (random_snr / 10))
-        std = torch.sqrt(noise_power)
+        std = torch.sqrt(noise_power) # Rimosso il .detach() per permettere il gradiente sulla potenza
 
         # Sample & scale noise
         noise = torch.randn_like(tensor) * std
@@ -39,15 +39,6 @@ class Gaussian_Noise_Analogic_Channel(nn.Module):
         # If in training mode add noise 
         if self.training:
             input = self.add_awgn_noise(input)
-
-        # Simple backward noise hook 
-        def _grad_hook(grad):
-            grad = self.add_awgn_noise(grad)
-            return grad
-            
-        # Register hook
-        if input.requires_grad:
-            input.register_hook(_grad_hook)
 
         return input
 

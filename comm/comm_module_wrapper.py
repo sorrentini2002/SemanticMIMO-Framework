@@ -172,9 +172,26 @@ class CommModuleWrapper(nn.Module):
         # --- Read importance scores for advanced allocation ---
         selection_scores = self._get_selection_scores(x)
 
+        # --- Mandatory Pre-Channel Power Normalization (Il Tetto di Cristallo) ---
+        # Costringe fisicamente l'energia media del batch/tensore compresso a 1.0.
+        # Disinnesca il reward hacking: se l'Encoder gonfia la magnitudo, viene schiacciato giù proporzionalmente.
+        rms = torch.sqrt(torch.mean(x ** 2, dim=(1, 2), keepdim=True))
+        x = x / (rms + 1e-9)
+
         # --- Run the full CommModule pipeline ---
         # CommModule returns (output_tensor, stats_dict).
         out, info = self.comm(x, selection_scores=selection_scores)
+        
+        # =====================================================================
+        # DIAGNOSTICS PHASE 3: Payload Integrity (Channel Impact)
+        # =====================================================================
+        if hasattr(self._score_source, "diagnostic_stats") and self.training:
+            stats = self._score_source.diagnostic_stats
+            stats["payload_x_norm"].append(x.norm().item())
+            stats["payload_out_norm"].append(out.norm().item())
+            # Verifichiamo la discrepanza creata solo dal canale (MSE L2 puro) Prima del padding
+            stats["payload_diff_norm"].append((x - out).norm().item())
+        # =====================================================================
 
         # --- Persist stats for external logging / SNR sweep ---
         self.last_info = info
@@ -195,6 +212,11 @@ class CommModuleWrapper(nn.Module):
             wandb.log(ch_stats)
         """
         return dict(self.last_info)
+        
+    def reconfigure(self, config_update: dict):
+        """Passes the configuration dictates (like SNR) down to the internal CommModule."""
+        if hasattr(self.comm, "reconfigure"):
+            self.comm.reconfigure(config_update)
 
     def set_channel_eval_only(self, enabled: bool) -> None:
         """

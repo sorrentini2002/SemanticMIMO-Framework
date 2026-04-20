@@ -112,6 +112,32 @@ class Gumbel_Token_Selection_Block_Wrapper(nn.Module):
         self.n_new_tokens = 0
         self._global_step = 0
 
+        # ==========================================
+        # SIMPLICIAL INTERACTING GRAPH (Branca a bypass dei Gradienti)
+        # ==========================================
+        # Estrarre embed_dim in modo sicuro saltando eventuali wrapper:
+        if hasattr(block, 'norm1'):
+            embed_dim = block.norm1.weight.shape[0]
+        else:
+            embed_dim = block.mlp.fc1.in_features  # Fallback
+            
+        # Proiezione per estrarre M_cls (Vettore marginale di contesto)
+        self.w_u = nn.Linear(embed_dim, embed_dim)
+        # Livello di interazione per computare il Triangolo Simpliciale
+        self.w_tri = nn.Linear(embed_dim, embed_dim)
+        # LayerNorm per stabilità locale prima del prodotto
+        self.norm_u = nn.LayerNorm(embed_dim)
+        self.norm_tri = nn.LayerNorm(embed_dim)
+        # Parametro di Forza Bruta inizializzato a 5.0 per costringere i gradienti (STE) a viaggiare qui
+        self.gamma = nn.Parameter(torch.tensor(5.0))
+
+        # Inizializzatore dizionario diagnostico
+        self.diagnostic_stats = {
+            "tau": [], "logits_std": [], "logits_mean": [], "entropy": [],
+            "grad_score_head": [], "grad_backbone": [],
+            "payload_x_norm": [], "payload_out_norm": [], "payload_diff_norm": []
+        }
+
     # ------------------------------------------------------------------
     # Step management
     # ------------------------------------------------------------------
@@ -159,26 +185,92 @@ class Gumbel_Token_Selection_Block_Wrapper(nn.Module):
         device = x.device
 
         # Number of patch tokens to keep
-        n_alpha = max(1, int(self.token_compression * num_patches))
+        target_n_alpha = max(1, int(self.token_compression * num_patches))
+        
+        # --- Multi-Budget Training: Vaccinazione Stocastica ---
+        # Durante il training, estraiamo un numero random di token per evitare il "Sequence Length Shock"
+        if self.training:
+            min_k = min(8, target_n_alpha)
+            max_k = min(num_patches, max(64, target_n_alpha * 2))
+            n_alpha = torch.randint(min_k, max_k + 1, (1,)).item()
+        else:
+            n_alpha = target_n_alpha
+            
         self.n_new_tokens = 1 + n_alpha  # CLS + selected patches
 
-        # ---- Retrieve CLS-row attention scores [B, N] ----
-        # The attention module at this block has been wrapped by
-        # Store_Class_Token_Attn_Wrapper (set up in build_model),
-        # which exposes `class_token_attention` of shape [B, N].
-        # We unsqueeze to [B, 1, N] so `sample_gumbel_topk` slices it correctly.
-        cls_attn = self.block.attn.class_token_attention.unsqueeze(1)  # [B, 1, N]
+        # ---- Ritorno all'Attenzione CLS (La 'Gabbia') ----
+        # I punteggi derivano dai pesi di attenzione originali del ViT: 
+        # sono già confinati in [0, 1] perché in uscita da un softmax.
+        cls_attention = self.block.attn.class_token_attention
+        base_patch_scores = cls_attention[:, 1:] # [B, N-1]
+
+        # ==========================================
+        # 1. SOSTITUZIONE DELLA METRICA (Simplicial Scoring)
+        # ==========================================
+        # Estraiamo M_cls (il contesto marginale del token di classificazione)
+        cls_token = x[:, 0:1, :] # [B, 1, D]
+        patch_tokens = x[:, 1:, :] # [B, N-1, D]
+        
+        # Calcoliamo le proiezioni per l'interazione
+        # [B, 1, D]
+        m_cls = self.norm_u(self.w_u(cls_token))
+        # [B, N-1, D]
+        patch_tri = self.norm_tri(self.w_tri(patch_tokens))
+        
+        # Interazione: calcoliamo il peso simpliciale s_j^{tri}
+        # Multi_Head attention interaction approssimata combinando la magnitudo L2
+        # per "rigonfiare" artificialmente l'attenzione piatta.
+        
+        # Magnitudo dell'interazione [B, N-1]
+        interaction_strength = torch.norm(m_cls * patch_tri, p=2, dim=-1)
+        
+        # Inject Forza Bruta (Gamma) per obbligare il gradiente a fluire
+        # Il parametro gamma (init a 5.0) costringe lo score a risvegliarsi dal layer.
+        simplicial_scores = base_patch_scores * (1.0 + self.gamma * interaction_strength)
+        
+        # Normalizziamo nuovamente a probabilità (per mantenere la validità per il Gumbel)
+        patch_scores_probs = F.softmax(simplicial_scores, dim=-1)
+        # ==========================================
 
         # ---- Gumbel select directly from imported module ----
         tau = self.current_tau
+
+        # -- Pre-Channel Batch Entropy Regularization (Spatial Diversity) --
+        # 1. Passaggio alla Batch Entropy: calcoliamo la distribuzione media sul batch
+        # per evitare l'Index Collapse, permettendo però alla rete di polarizzarsi 
+        # (sharpness alta) sulla singola istanza/immagine individualmente.
+        p_mean = patch_scores_probs.mean(dim=0)
+        entropy_reg_loss = -torch.sum(p_mean * torch.log(p_mean + 1e-9))
+        self.entropy_reg_loss = entropy_reg_loss
+
+        # =====================================================================
+        # DIAGNOSTICS PHASE 1 & 2: Sharpness, Temperature, & STE Gradient Audit
+        # =====================================================================
+        if hasattr(self, "diagnostic_stats") and self.training:
+            # 1. Log Temperature and Sharpness
+            self.diagnostic_stats["tau"].append(tau)
+            self.diagnostic_stats["logits_std"].append(simplicial_scores.std().item())
+            self.diagnostic_stats["logits_mean"].append(simplicial_scores.mean().item())
+            
+            # L'entropia matematica H = -sum(p * log p)
+            entropy_val = -torch.sum(patch_scores_probs * torch.log(patch_scores_probs + 1e-9), dim=-1).mean()
+            self.diagnostic_stats["entropy"].append(entropy_val.item())
+
+            # 2. Registrazione Hooks per Audit del Gradiente STE
+            if simplicial_scores.requires_grad:
+                simplicial_scores.register_hook(lambda g: self.diagnostic_stats["grad_score_head"].append(g.norm().item()))
+            if x.requires_grad:
+                x.register_hook(lambda g: self.diagnostic_stats["grad_backbone"].append(g.norm().item()))
+        # =====================================================================
+
         tokens_sel, indices_sel, patch_scores, gs_tau = sample_gumbel_topk(
             tokens=x,
-            attn=cls_attn,
+            scores=patch_scores_probs,
             n_alpha=n_alpha,
             tau=tau,
             hard=self.hard,
             straight_through=self.straight_through,
-            generator=None
+            generator=None,
         )
         # tokens_sel : [B, 1 + n_alpha, D]
         # patch_scores : [B, num_patches]
@@ -191,10 +283,14 @@ class Gumbel_Token_Selection_Block_Wrapper(nn.Module):
         # indices_sel[:, 1:] are global indices (1..N-1) of the kept patches.
         # patch_scores indices are 0..N-2.  So we need: patch_scores[:, idx-1].
         selected_patch_indices = indices_sel[:, 1:] - 1                    # [B, n_alpha], 0-based
-        selected_patch_scores = torch.gather(patch_scores, 1, selected_patch_indices)  # [B, n_alpha]
+        selected_patch_scores = torch.gather(patch_scores_probs, 1, selected_patch_indices)  # [B, n_alpha]
 
         cls_dummy = torch.ones((B, 1), dtype=selected_patch_scores.dtype, device=device)
         self.last_adc_scores = torch.cat([cls_dummy, selected_patch_scores], dim=1)  # [B, 1 + n_alpha]
+        
+        # --- Store indices for Server Spatial Reconstruction ---
+        self.last_indices_sel = indices_sel
+        self.last_original_N = N
 
         return tokens_sel
 
@@ -290,7 +386,9 @@ class Store_Class_Token_Attn_Wrapper(nn.Module):
         attn = attn.softmax(dim=-1)
 
         # Store CLS-row attention averaged across heads  →  [B, N]
-        self.class_token_attention = attn[:, :, 0, :].mean(dim=1).detach()
+        # NOTE: Do NOT detach here — gradient must flow through scores
+        # to the QKV weights for Gumbel-Softmax STE to learn a selection policy.
+        self.class_token_attention = attn[:, :, 0, :].mean(dim=1)
 
         # Normal attention output
         attn = self.attn.attn_drop(attn)

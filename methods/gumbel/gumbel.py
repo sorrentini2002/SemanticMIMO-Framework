@@ -29,11 +29,14 @@ def compute_gumbel_mc_scores(scores, num_samples=16, tau=0.5, aggregate="mean", 
         
     gumbel_noise = -torch.log(-torch.log(u + eps) + eps)
     
-    # Broadcast scores to [num_samples, B, num_patches]
+    # Expand scores to [num_samples, B, num_patches]
     scores_expanded = scores.unsqueeze(0).expand(num_samples, -1, -1)
     
-    # Softmax over perturbed scores
-    noisy_scores = scores_expanded + gumbel_noise * tau
+    # 1. Removal of Logarithm (Linear Sampling)
+    # 2. Decay Noise Amplitude: physical amplitude of noise decays with temperature
+    noisy_scores = scores_expanded + (gumbel_noise * tau)
+    
+    # 3. Exponential Amplification via 'Double Softmax'
     p_soft = F.softmax(noisy_scores / tau, dim=-1)
     
     # Aggregate
@@ -72,20 +75,21 @@ def sample_gumbel_from_scores(scores, n_alpha, tau=1.0, hard=True, straight_thro
          
     gumbel_noise = -torch.log(-torch.log(u + eps) + eps)
     
-    # 2. Add noise
-    # We apply noise scaled by tau (Noise Annealing) so that:
-    # - tau -> 0: Noise vanishes, selection becomes deterministic argmax(scores).
-    # - tau -> inf: Noise dominates, selection becomes uniform.
-    noisy_scores = scores + gumbel_noise * tau
+    # 2. Add noise with Decaying Amplitude
+    # 1. Removal of Logarithm: treat attention probabilities directly as linear inputs
+    noisy_scores = scores + (gumbel_noise * tau)
     
-    # 3. Soft Probabilities
-    # m_soft approx softmax(scores/tau + g)
+    # 3. Soft Probabilities - Exponential Amplification via 'Double Softmax'
+    # By omitting the logarithm, dividing the already-softmaxed linear scores by tau
+    # inside this second softmax converts micro-differences into explosive peaks.
     m_soft = F.softmax(noisy_scores / tau, dim=-1)
     
     # 4. Hard Selection
     _, topk_relative_indices = torch.topk(noisy_scores, k=n_alpha, dim=1, sorted=False)
     
     # 5. Straight-Through Mask
+    # Pure mathematical magnitude: we do NOT artificially scale the gradient by n_alpha,
+    # allowing the raw JSCC physics and true probabilities to drive the backpropagation.
     m = None
     if straight_through:
         m_hard = torch.zeros_like(scores)
@@ -94,17 +98,21 @@ def sample_gumbel_from_scores(scores, n_alpha, tau=1.0, hard=True, straight_thro
         
     return topk_relative_indices, m, tau
 
-def sample_gumbel_topk(tokens, attn, n_alpha, tau=1.0, hard=True, straight_through=True, generator=None):
+def sample_gumbel_topk(tokens, attn=None, n_alpha=1, tau=1.0, hard=True, straight_through=True, generator=None, scores=None):
     """
-    Select top-k tokens based on CLS attention scores with Gumbel noise.
+    Select top-k tokens based on CLS attention scores or explicit patch scores, with Gumbel noise.
+    
+    Args:
+        scores: [B, N-1] explicit scores for each patch token. If provided, attn is ignored.
     """
     B, N, D = tokens.shape
     
     # Handle already averaged attention
-    if attn.dim() == 4:
-        attn_mean = attn.mean(dim=1)
-    else:
-        attn_mean = attn
+    if attn is not None:
+        if attn.dim() == 4:
+            attn_mean = attn.mean(dim=1)
+        else:
+            attn_mean = attn
         
     # Validation
     if n_alpha >= N - 1:
@@ -115,9 +123,14 @@ def sample_gumbel_topk(tokens, attn, n_alpha, tau=1.0, hard=True, straight_throu
         indices = torch.zeros((B, 1), dtype=torch.long, device=tokens.device)
         return gather_tokens(tokens, indices), indices, None, tau
         
-    # Get scores (CLS attention)
-    cls_scores = attn_mean[:, 0, :]
-    patch_scores = cls_scores[:, 1:] # [B, N-1]
+    # Get scores
+    if scores is not None:
+        patch_scores = scores
+    elif attn is not None:
+        cls_scores = attn_mean[:, 0, :]
+        patch_scores = cls_scores[:, 1:] # [B, N-1]
+    else:
+        raise ValueError("Must provide either attn or scores to sample_gumbel_topk")
     
     # Use extracted function
     topk_relative_indices, m, gs_tau = sample_gumbel_from_scores(
@@ -131,7 +144,7 @@ def sample_gumbel_topk(tokens, attn, n_alpha, tau=1.0, hard=True, straight_throu
     # Add CLS
     cls_indices = torch.zeros((B, 1), dtype=torch.long, device=tokens.device)
     indices_sel = torch.cat([cls_indices, topk_indices], dim=1)
-    
+
     # Gather
     tokens_sel = gather_tokens(tokens, indices_sel)
     

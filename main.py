@@ -43,11 +43,29 @@ def training_phase(model, train_data_loader, loss, optimizer, device, plot):
     # Counter   
     iterations = 0
     # Forward the train set
+    import random
     for batch in tqdm(train_data_loader, disable=not plot):
 
         # Get input and labels from batch
         batch_input = batch[0].to(device)
         batch_labels = batch[1].to(device)
+
+        # --- Dynamic SNR Training ---
+        # Ogni batch il canale subisce un SNR variabile random per impedire
+        # al rumore costante di avvelenare totalmente l'STE pre-canale.
+        if hasattr(model, "channel") and hasattr(model.channel, "reconfigure"):
+            dynamic_snr = random.uniform(0.0, 20.0)
+            model.channel.reconfigure({'channel': {'snr_db': dynamic_snr}})
+
+        # --- Gumbel-Softmax step registration (temperature annealing) ---
+        # The compressor_module tracks a global step counter used
+        # to anneal the Gumbel temperature from tau_start → tau_end.
+        # Without this, tau stays at tau_start forever.
+        if hasattr(model, 'compressor_module') and hasattr(model.compressor_module, 'register_step'):
+            if not hasattr(model, '_gumbel_global_step'):
+                model._gumbel_global_step = 0
+            model.compressor_module.register_step(model._gumbel_global_step)
+            model._gumbel_global_step += 1
 
         # Get batch predictions
         batch_predictions = model(batch_input)
@@ -73,6 +91,14 @@ def training_phase(model, train_data_loader, loss, optimizer, device, plot):
         # Get batch loss
         batch_loss = loss(batch_predictions, batch_labels)
 
+        # --- Pre-Channel Batch Entropy Regularization (Spatial Diversity) ---
+        if hasattr(model, "compressor_module") and hasattr(model.compressor_module, "entropy_reg_loss"):
+            # Sottraiamo la Batch Entropy (H positiva calcolata in gumbel_method.py) 
+            # pesandola molto poco in modo da non murare il gradiente STE.
+            # Questo garantisce l'esplorazione spaziale senza penalizzare la sharpness.
+            entropy_weight = 0.05 
+            batch_loss = batch_loss - (entropy_weight * model.compressor_module.entropy_reg_loss)
+
         iterations+=1
 
         # Store them
@@ -83,6 +109,7 @@ def training_phase(model, train_data_loader, loss, optimizer, device, plot):
         batch_loss.backward()  
 
         # Update and zero out previous gradients
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         optimizer.zero_grad()
 
@@ -172,6 +199,33 @@ def training_schedule(model, train_data_loader, val_data_loader, optimizer, num_
             # Training phase 
             avg_train_loss, avg_train_accuracy, train_stats = training_phase(model, train_data_loader, loss, optimizer, device, plot)
             
+            # =====================================================================
+            # DIAGNOSTICS DUMP: Salva le stat dell'epoca in JSON
+            # =====================================================================
+            if hasattr(model, 'compressor_module') and hasattr(model.compressor_module, 'diagnostic_stats'):
+                import numpy as np
+                import json
+                
+                stats = model.compressor_module.diagnostic_stats
+                # Crea un dizionario di medie per questa epoca
+                epoch_diag_summary = {}
+                for k, v_list in stats.items():
+                    if len(v_list) > 0:
+                        epoch_diag_summary[k] = float(np.mean(v_list))
+                    
+                # Scrivi o appendi il file JSON
+                diag_file = os.path.join(hydra_output_dir, "diagnostic_gumbel.json")
+                
+                # Append line by line as JSONL
+                with open(diag_file, "a") as f:
+                    epoch_diag_summary["epoch"] = epoch
+                    f.write(json.dumps(epoch_diag_summary) + "\n")
+                
+                # Pulisce i vettori per la prossima epoca, salvando la RAM
+                for k in stats.keys():
+                    stats[k].clear()
+            # =====================================================================
+
             # --- Validation and SNR Sweep ---
             snr_sweep = []
             if 'eval' in cfg and 'snr_sweep' in cfg.eval:
@@ -395,7 +449,53 @@ def main(cfg):
                                         model=model).to(device)
 
         # Get optimizer
-        optimizer = hydra.utils.instantiate(cfg.optimizer, params=model.parameters())
+        # Disaccoppiamento Gradienti Quad-Stage (Con Simplicial Bypass):
+        # - Testa Lineare e Decoder (LR Globale 3e-4)
+        # - Encoder (10x in meno = 3e-5 per proteggere features ImageNet)
+        # - Simplicial Branch (10x in più = 3e-3 per bypassare il weight decay e "risvegliare" Gumbel)
+        encoder_params = []
+        decoder_params = []
+        head_params = []
+        simplicial_params = []
+        
+        split_idx = cfg.hyperparameters.split_index
+        
+        import re
+        for name, param in model.named_parameters():
+            if 'compressor_module.w_u' in name or 'compressor_module.w_tri' in name or 'compressor_module.norm' in name or 'compressor_module.gamma' in name:
+                simplicial_params.append(param)
+            elif 'head' in name:
+                head_params.append(param)
+            else:
+                is_encoder = False
+                # Encoder components: patch_embed, cls_token, pos_embed, and blocks prima dello split
+                if any(x in name for x in ['patch_embed', 'cls_token', 'pos_embed']):
+                    is_encoder = True
+                elif 'blocks.' in name:
+                    match = re.search(r'blocks\.(\d+)', name)
+                    if match:
+                        block_idx = int(match.group(1))
+                        # blocks_before take indices 0 up to split_idx - 1
+                        if block_idx < split_idx:
+                            is_encoder = True
+                
+                # L'encoder viene protetto. Il Decoder (blocks >= split_idx, norm) e il resto mantengono LR veloce
+                if is_encoder:
+                    encoder_params.append(param)
+                else:
+                    decoder_params.append(param)
+                
+        # Inizializza l'ottimizzatore col Decoder (LR globale = 3e-4)
+        optimizer = hydra.utils.instantiate(cfg.optimizer, params=(p for p in decoder_params))
+        
+        # Aggiungi separatamente l'Encoder come gruppo rallentato (LR x0.1 = 3e-5)
+        optimizer.add_param_group({'params': encoder_params, 'lr': cfg.optimizer.lr * 0.1})
+        
+        # Aggiungi la Testa Lineare (LR globale = 3e-4)
+        optimizer.add_param_group({'params': head_params, 'lr': cfg.optimizer.lr})
+        
+        # Aggiungi la Branca Simpliciale (LR Moltiplicato x10 = 3e-3 per scappare dal comma)
+        optimizer.add_param_group({'params': simplicial_params, 'lr': cfg.optimizer.lr * 10.0})
 
         # Print model, dataset and method
         print(f"\n\nTraining seed {seed}: \n\n  --model: {cfg.model.model_name} \n  --dataset: {cfg.dataset.name} \n  --communication: {cfg.communication.name} \n  --method: {cfg.method.name} \n  --compression: {model.compression_ratio} \n")
