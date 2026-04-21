@@ -4,8 +4,6 @@ To more concretely investigate the differences between the two methods, we teste
 
 ![Trade-off between compression and accuracy for different SNR regimes](../Plots/baseline/plt10.png) |
 
-The results indicate that...
-
 # Experimental Results Overview
 
 This document summarizes the simulation results obtained from the split-learning pipeline, focusing on the model's resilience to token selection and bottleneck compression under noisy communication channels (AWGN and MIMO).
