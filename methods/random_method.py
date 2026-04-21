@@ -116,6 +116,10 @@ class Random_Token_Selection_Block_Wrapper(nn.Module):
 
         cls_dummy = torch.ones((bsz, 1), dtype=x.dtype, device=device)
         self.last_adc_scores = torch.cat([cls_dummy, selected_patch_scores], dim=1)
+        
+        # --- Store indices for Server Spatial Reconstruction ---
+        self.last_indices_sel = indices_sel
+        self.last_original_N = x.shape[1]
 
         return tokens_sel
 

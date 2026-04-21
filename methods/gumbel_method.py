@@ -128,8 +128,9 @@ class Gumbel_Token_Selection_Block_Wrapper(nn.Module):
         # LayerNorm per stabilità locale prima del prodotto
         self.norm_u = nn.LayerNorm(embed_dim)
         self.norm_tri = nn.LayerNorm(embed_dim)
-        # Parametro di Forza Bruta inizializzato a 5.0 per costringere i gradienti (STE) a viaggiare qui
-        self.gamma = nn.Parameter(torch.tensor(5.0))
+        # Parametro di Forza Bruta inizializzato da config per controllare la polarizzazione dei logits
+        self.gamma = nn.Parameter(torch.tensor(method_cfg.get('gamma_init', 5.0)))
+        self.beta = nn.Parameter(torch.tensor(method_cfg.get('beta_init', 0.0)))
 
         # Inizializzatore dizionario diagnostico
         self.diagnostic_stats = {
@@ -224,13 +225,24 @@ class Gumbel_Token_Selection_Block_Wrapper(nn.Module):
         # Magnitudo dell'interazione [B, N-1]
         interaction_strength = torch.norm(m_cls * patch_tri, p=2, dim=-1)
         
-        # Inject Forza Bruta (Gamma) per obbligare il gradiente a fluire
-        # Il parametro gamma (init a 5.0) costringe lo score a risvegliarsi dal layer.
-        simplicial_scores = base_patch_scores * (1.0 + self.gamma * interaction_strength)
+        # Interazione base (senza gamma prepensato, applicato post-standardizzazione)
+        simplicial_scores = base_patch_scores * (1.0 + interaction_strength)
         
-        # Normalizziamo nuovamente a probabilità (per mantenere la validità per il Gumbel)
-        patch_scores_probs = F.softmax(simplicial_scores, dim=-1)
         # ==========================================
+        # 1. Eliminazione totale L1 Norm / Logaritmo
+        # 2. Implementazione Z-Score Standardization + Trasformazione Affine
+        # ==========================================
+        # Forniamo Energie pure / Raw Logits
+        sm_mean = simplicial_scores.mean(dim=-1, keepdim=True)
+        sm_std = simplicial_scores.std(dim=-1, keepdim=True)
+        # Forza media 0 e varianza 1 lungo la dimensione spaziale (token)
+        standardized_scores = (simplicial_scores - sm_mean) / (sm_std + 1e-9)
+
+        # Trasformazione Affine Apprendibile: Ripristina la capacità di gridare del segnale
+        final_logits = self.gamma * standardized_scores + self.beta
+
+        # Per il p_mean della regularization/entropy calcoliamo un softmax esplorativo
+        patch_scores_probs = F.softmax(final_logits, dim=-1)
 
         # ---- Gumbel select directly from imported module ----
         tau = self.current_tau
@@ -249,23 +261,23 @@ class Gumbel_Token_Selection_Block_Wrapper(nn.Module):
         if hasattr(self, "diagnostic_stats") and self.training:
             # 1. Log Temperature and Sharpness
             self.diagnostic_stats["tau"].append(tau)
-            self.diagnostic_stats["logits_std"].append(simplicial_scores.std().item())
-            self.diagnostic_stats["logits_mean"].append(simplicial_scores.mean().item())
+            self.diagnostic_stats["logits_std"].append(final_logits.std().item())
+            self.diagnostic_stats["logits_mean"].append(final_logits.mean().item())
             
             # L'entropia matematica H = -sum(p * log p)
             entropy_val = -torch.sum(patch_scores_probs * torch.log(patch_scores_probs + 1e-9), dim=-1).mean()
             self.diagnostic_stats["entropy"].append(entropy_val.item())
 
             # 2. Registrazione Hooks per Audit del Gradiente STE
-            if simplicial_scores.requires_grad:
-                simplicial_scores.register_hook(lambda g: self.diagnostic_stats["grad_score_head"].append(g.norm().item()))
+            if final_logits.requires_grad:
+                final_logits.register_hook(lambda g: self.diagnostic_stats["grad_score_head"].append(g.norm().item()))
             if x.requires_grad:
                 x.register_hook(lambda g: self.diagnostic_stats["grad_backbone"].append(g.norm().item()))
         # =====================================================================
 
         tokens_sel, indices_sel, patch_scores, gs_tau = sample_gumbel_topk(
             tokens=x,
-            scores=patch_scores_probs,
+            scores=final_logits,  # PASS AFFINE TRANSFORMED LOGITS
             n_alpha=n_alpha,
             tau=tau,
             hard=self.hard,
@@ -291,6 +303,8 @@ class Gumbel_Token_Selection_Block_Wrapper(nn.Module):
         # --- Store indices for Server Spatial Reconstruction ---
         self.last_indices_sel = indices_sel
         self.last_original_N = N
+
+        # NOTE: tokens_sel are already masked by sample_gumbel_topk (STE logic inside gumbel.py)
 
         return tokens_sel
 

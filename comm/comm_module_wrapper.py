@@ -127,9 +127,9 @@ class CommModuleWrapper(nn.Module):
         if attn is None or not torch.is_tensor(attn):
             return None
 
-        # Detach and move to the same device as x (attention may have
+        # Move to the same device as x (attention may have
         # been computed before a device transfer).
-        scores = attn.detach().to(device=x.device, dtype=x.dtype)
+        scores = attn.to(device=x.device, dtype=x.dtype)
 
         # ── Score alignment contract ──────────────────────────────────
         # class_token_attention has shape [B, N] where:
@@ -171,6 +171,8 @@ class CommModuleWrapper(nn.Module):
 
         # --- Read importance scores for advanced allocation ---
         selection_scores = self._get_selection_scores(x)
+        # RECUPERO INDICI PER INTEGRITÀ SPAZIALE (The Index Bridge)
+        selection_indices = getattr(self._score_source, "last_indices_sel", None)
 
         # --- Mandatory Pre-Channel Power Normalization (Il Tetto di Cristallo) ---
         # Costringe fisicamente l'energia media del batch/tensore compresso a 1.0.
@@ -180,7 +182,9 @@ class CommModuleWrapper(nn.Module):
 
         # --- Run the full CommModule pipeline ---
         # CommModule returns (output_tensor, stats_dict).
-        out, info = self.comm(x, selection_scores=selection_scores)
+        # Ora passiamo esplicitamente selection_indices per permettere il routing spaziale
+        out, info = self.comm(x, selection_indices=selection_indices, selection_scores=selection_scores)
+        
         
         # =====================================================================
         # DIAGNOSTICS PHASE 3: Payload Integrity (Channel Impact)

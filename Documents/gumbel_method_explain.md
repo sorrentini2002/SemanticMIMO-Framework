@@ -217,3 +217,40 @@ The zero-padding reconstruction previously performed at the Server-side has been
 - The Server now processes the condensed feature set directly. 
 - This prevents the model from learning "fake" geometric cues from the absolute zeros used in padding, which was previously causing instabilities in the Server's LayerNorm and Self-Attention layers.
 
+---
+
+### Advanced Architectural and Training Enhancements
+
+The following features were subsequently added to refine the geometric understanding and training stability of the Gumbel-Softmax pipeline.
+
+#### 9. Geometric Simplicial Scoring Branch
+To refine token selection beyond raw class attention, we introduced a **Simplicial Interacting Graph** logic. This branch uses two dedicated linear projections (`w_u` and `w_tri`) and LayerNorm layers to compute a "contextual marginal vector" ($m_{cls}$) and a "simplicial interaction triangle" ($patch_{tri}$). The resulting `interaction_strength` augments the base attention scores, allowing the model to capture higher-order relationships between the CLS token and the image patches.
+
+#### 10. Initial Score Polarization ($\gamma = 5.0$)
+A learnable "Brute Force" parameter ($\gamma$) was initialized at **5.0** to immediately polarize the selection scores during the early stages of training. This high initial value ensures that the Straight-Through Estimator (STE) receives sharp signals, forcing the scoring head to converge quickly on a semantically coherent policy before the Gumbel temperature $\tau$ decays significantly.
+
+#### 11. Multi-Stage Differential Learning Rates
+The optimizer configuration in `main.py` uses a **Tri-Stage Learning Rate** strategy to stabilize the split-learning architecture:
+- **Encoder/Backbone**: Limited to a lower LR ($3\times 10^{-5}$) to prevent catastrophic forgetting of pre-trained spatial features.
+- **Server/Decoder**: Set to a standard LR ($3\times 10^{-4}$) to allow rapid adaptation to the sparse token payload.
+- **Classification & Scoring Heads**: Boosted with a $10\times$ multiplier ($3\times 10^{-3}$) to act as a "hydraulic shield"—absorbing initial entropy shocks and providing stabilized gradient signals to the upstream modules.
+
+#### 12. Stabilization: Clipping and Weight Decay
+To further steady the training process, two critical mechanisms were implemented:
+- **Global Gradient Clipping**: All gradients are capped at a `max_norm` of 1.0 using `torch.nn.utils.clip_grad_norm_`. This prevents "gradient spikes" from the decoder from destabilizing the core backbone.
+- **Aggressive Weight Decay**: The `AdamW` weight decay was increased to **0.05**. This penalizes the model for arbitrarily inflating weights to bypass channel constraints, encouraging a more efficient and generalized representation.
+
+#### 13. Stochastic Multi-Budget Training ("Vaccination")
+To prevent the Server-side decoder from overfitting to a specific sequence length, we implemented **Multi-Budget Training**. During training, the number of selected tokens ($n_{\alpha}$) is sampled randomly for each batch within a range (e.g., between 8 and 64 tokens). This "vaccination" strategy forces the model to be robust to varying bandwidth conditions, ensuring superior performance when a fixed budget is enforced during evaluation.
+
+#### 14. Z-Score Standardization for Scores
+The legacy L1 normalization and log-transformations for scores were replaced with **Z-Score Standardization** across the spatial token dimension. By centering the scores (zero-mean) and scaling them (unit-variance) before the Gumbel addition, we ensure the raw logits operate consistently with the temperature parameter $\tau$, preventing signal disintegration.
+
+#### 15. Power Normalization ("The Crystal Ceiling")
+To prevent "reward hacking"—where the model might increase signal energy to artificially improve the effective SNR—we introduced a mandatory **RMS Power Normalization** block in `comm_module_wrapper.py`. This physically constrains the average energy of the compressed tensor to 1.0 before it enters the channel simulator.
+
+#### 16. Joint Loss Optimization
+The training objective was unified in `main.py` into a single, cohesive calculation: `loss = task_loss + (entropy_weight * entropy_loss)`. This ensures that entropy regularization (promoting spatial diversity) is balanced correctly against the classification objective in every optimization step.
+
+#### 17. Index Synchronization
+The CommModuleWrapper now extracts last_indices_sel from the Gumbel selector and passes it to the CommModule. This enables Unequal Error Protection (UEP): tokens deemed most important by the Gumbel branch are now physically routed through the most robust MIMO spatial streams (those associated with the highest singular values).

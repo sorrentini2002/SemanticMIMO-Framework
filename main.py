@@ -27,7 +27,7 @@ OmegaConf.register_new_resolver("flatten_params", flatten_params)
 
 
 # Standard training phase 
-def training_phase(model, train_data_loader, loss, optimizer, device, plot):
+def training_phase(model, train_data_loader, loss, optimizer, device, plot, current_epoch=1, num_epochs=1):
 
     if plot:
         print("\nTraining phase: ")
@@ -44,17 +44,25 @@ def training_phase(model, train_data_loader, loss, optimizer, device, plot):
     iterations = 0
     # Forward the train set
     import random
+    
+    # --- SNR Range Decision (Accelerated Sampling) ---
+    # Last 1/5 of epochs: fine-tuning phase with higher SNR range
+    late_phase_start = max(1, num_epochs - num_epochs // 5)
+    if current_epoch >= late_phase_start:
+        snr_range = (10.0, 20.0)  # High SNR for fine-tuning
+    else:
+        snr_range = (0.0, 20.0)   # Full range for robust exploration
+    
     for batch in tqdm(train_data_loader, disable=not plot):
 
         # Get input and labels from batch
         batch_input = batch[0].to(device)
         batch_labels = batch[1].to(device)
 
-        # --- Dynamic SNR Training ---
-        # Ogni batch il canale subisce un SNR variabile random per impedire
-        # al rumore costante di avvelenare totalmente l'STE pre-canale.
+        # --- Accelerated SNR Training ---
+        # Campiona SNR dal range appropriato per la fase attuale
         if hasattr(model, "channel") and hasattr(model.channel, "reconfigure"):
-            dynamic_snr = random.uniform(0.0, 20.0)
+            dynamic_snr = random.uniform(snr_range[0], snr_range[1])
             model.channel.reconfigure({'channel': {'snr_db': dynamic_snr}})
 
         # --- Gumbel-Softmax step registration (temperature annealing) ---
@@ -96,8 +104,8 @@ def training_phase(model, train_data_loader, loss, optimizer, device, plot):
             # Sottraiamo la Batch Entropy (H positiva calcolata in gumbel_method.py) 
             # pesandola molto poco in modo da non murare il gradiente STE.
             # Questo garantisce l'esplorazione spaziale senza penalizzare la sharpness.
-            entropy_weight = 0.05 
-            batch_loss = batch_loss - (entropy_weight * model.compressor_module.entropy_reg_loss)
+            entropy_weight = 0.01
+            batch_loss = batch_loss + (entropy_weight * model.compressor_module.entropy_reg_loss)
 
         iterations+=1
 
@@ -190,6 +198,17 @@ def training_schedule(model, train_data_loader, val_data_loader, optimizer, num_
     final_results_file = os.path.join(hydra_output_dir, "final_training_results.json")
     best_results_file = os.path.join(hydra_output_dir, "best_training_results.json")
     results = {}
+    
+    # --- Compressed Schedule: Calculate total steps for cosine annealing ---
+    # Questo assicura che tau scenda da 2.0 a 0.3 esattamente entro le num_epochs disponibili
+    total_steps = len(train_data_loader) * num_epochs
+    if hasattr(model, 'compressor_module') and hasattr(model.compressor_module, 'anneal_steps'):
+        original_anneal_steps = model.compressor_module.anneal_steps
+        model.compressor_module.anneal_steps = total_steps
+        if plot:
+            print(f"\n=== Gumbel Annealing: total_steps={total_steps} (was {original_anneal_steps})")
+            print(f"    Temperature tau will anneal from {model.compressor_module.tau_max} to {model.compressor_module.tau_min} over {num_epochs} epochs")
+    
     try:
         for epoch in range(1, num_epochs + 1):
             torch.cuda.empty_cache()
@@ -197,7 +216,7 @@ def training_schedule(model, train_data_loader, val_data_loader, optimizer, num_
                 print(f"\n\nEPOCH {epoch}")
 
             # Training phase 
-            avg_train_loss, avg_train_accuracy, train_stats = training_phase(model, train_data_loader, loss, optimizer, device, plot)
+            avg_train_loss, avg_train_accuracy, train_stats = training_phase(model, train_data_loader, loss, optimizer, device, plot, current_epoch=epoch, num_epochs=num_epochs)
             
             # =====================================================================
             # DIAGNOSTICS DUMP: Salva le stat dell'epoca in JSON
@@ -448,54 +467,73 @@ def main(cfg):
                                         split_index = cfg.hyperparameters.split_index,
                                         model=model).to(device)
 
-        # Get optimizer
-        # Disaccoppiamento Gradienti Quad-Stage (Con Simplicial Bypass):
-        # - Testa Lineare e Decoder (LR Globale 3e-4)
-        # - Encoder (10x in meno = 3e-5 per proteggere features ImageNet)
-        # - Simplicial Branch (10x in più = 3e-3 per bypassare il weight decay e "risvegliare" Gumbel)
-        encoder_params = []
-        decoder_params = []
-        head_params = []
-        simplicial_params = []
+        # ======================================================================
+        # Disaccoppiamento Gradienti e Weight Decay (JSCC Cures)
+        # ======================================================================
+        base_lr = cfg.optimizer.lr
+        base_wd = cfg.optimizer.weight_decay
+
+        encoder_2d = []
+        decoder_2d = []
+        simplicial_2d = []
         
+        encoder_1d = []
+        decoder_1d = []
+        simplicial_1d = []
+
         split_idx = cfg.hyperparameters.split_index
-        
         import re
+
         for name, param in model.named_parameters():
-            if 'compressor_module.w_u' in name or 'compressor_module.w_tri' in name or 'compressor_module.norm' in name or 'compressor_module.gamma' in name:
-                simplicial_params.append(param)
-            elif 'head' in name:
-                head_params.append(param)
-            else:
-                is_encoder = False
-                # Encoder components: patch_embed, cls_token, pos_embed, and blocks prima dello split
+            if not param.requires_grad:
+                continue
+
+            # 1. Identificazione del Dominio (Encoder, Decoder/Head, Simplicial)
+            is_simplicial = any(x in name for x in ['compressor_module.w_u', 'compressor_module.w_tri', 'compressor_module.norm', 'compressor_module.gamma', 'compressor_module.beta'])
+            
+            is_encoder = False
+            if not is_simplicial and not 'head' in name:
                 if any(x in name for x in ['patch_embed', 'cls_token', 'pos_embed']):
                     is_encoder = True
                 elif 'blocks.' in name:
                     match = re.search(r'blocks\.(\d+)', name)
-                    if match:
-                        block_idx = int(match.group(1))
-                        # blocks_before take indices 0 up to split_idx - 1
-                        if block_idx < split_idx:
-                            is_encoder = True
-                
-                # L'encoder viene protetto. Il Decoder (blocks >= split_idx, norm) e il resto mantengono LR veloce
-                if is_encoder:
-                    encoder_params.append(param)
-                else:
-                    decoder_params.append(param)
-                
-        # Inizializza l'ottimizzatore col Decoder (LR globale = 3e-4)
-        optimizer = hydra.utils.instantiate(cfg.optimizer, params=(p for p in decoder_params))
-        
-        # Aggiungi separatamente l'Encoder come gruppo rallentato (LR x0.1 = 3e-5)
-        optimizer.add_param_group({'params': encoder_params, 'lr': cfg.optimizer.lr * 0.1})
-        
-        # Aggiungi la Testa Lineare (LR globale = 3e-4)
-        optimizer.add_param_group({'params': head_params, 'lr': cfg.optimizer.lr})
-        
-        # Aggiungi la Branca Simpliciale (LR Moltiplicato x10 = 3e-3 per scappare dal comma)
-        optimizer.add_param_group({'params': simplicial_params, 'lr': cfg.optimizer.lr * 10.0})
+                    if match and int(match.group(1)) < split_idx:
+                        is_encoder = True
+
+            is_decoder_or_head = not is_simplicial and not is_encoder
+
+            # 2. Identificazione della Geometria (Forzatura No-Weight-Decay)
+            # Se ha 1D (bias, scale, gamma, cls_token, pos_embed) o si chiama 'norm', disabilita il WD
+            is_1d_or_norm = param.ndim <= 1 or 'norm' in name or 'bias' in name
+
+            # 3. Smistamento
+            if is_simplicial:
+                if is_1d_or_norm: simplicial_1d.append(param)
+                else: simplicial_2d.append(param)
+            elif is_encoder:
+                if is_1d_or_norm: encoder_1d.append(param)
+                else: encoder_2d.append(param)
+            elif is_decoder_or_head:
+                if is_1d_or_norm: decoder_1d.append(param)
+                else: decoder_2d.append(param)
+
+        param_groups = [
+            # ENCODER (ImageNet Protection)
+            {'params': encoder_2d, 'lr': base_lr * 0.1, 'weight_decay': base_wd},
+            {'params': encoder_1d, 'lr': base_lr * 0.1, 'weight_decay': 0.0},
+            
+            # DECODER & HEAD (Sequence Shock Adaptation)
+            {'params': decoder_2d, 'lr': base_lr, 'weight_decay': base_wd},
+            {'params': decoder_1d, 'lr': base_lr, 'weight_decay': 0.0},
+            
+            # SIMPLICIAL BRANCH (Free Growth & Bypass)
+            {'params': simplicial_2d, 'lr': base_lr * 10.0, 'weight_decay': 0.0}, # Forza bruta a briglia sciolta
+            {'params': simplicial_1d, 'lr': base_lr * 10.0, 'weight_decay': 0.0}
+        ]
+
+        # Inizializzazione diretta di AdamW bypassando l'instantiation limitante di Hydra
+        optimizer = torch.optim.AdamW(param_groups, eps=cfg.optimizer.eps)
+        # ======================================================================
 
         # Print model, dataset and method
         print(f"\n\nTraining seed {seed}: \n\n  --model: {cfg.model.model_name} \n  --dataset: {cfg.dataset.name} \n  --communication: {cfg.communication.name} \n  --method: {cfg.method.name} \n  --compression: {model.compression_ratio} \n")
