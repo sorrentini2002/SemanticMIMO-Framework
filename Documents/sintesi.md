@@ -2,9 +2,8 @@
 
 To more concretely investigate the differences between the two methods, we tested various scenarios to observe how the two techniques vary depending on the number of tokens being transmitted. The following charts show the comparison across different SNR regimes:
 
-![Trade-off between compression and accuracy for different SNR regimes](../Plots/baseline/plt10.png) |
+![Trade-off between compression and accuracy for different SNR regimes](../Plots/baseline/plt10.png)
 
-The results indicate that...
 
 # Experimental Results Overview
 
