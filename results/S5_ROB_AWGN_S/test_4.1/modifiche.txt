@@ -1,0 +1,3 @@
+cov_reg_weight: da 0.2 a 0.0
+entropy_target_end: da 1.8 a 2.5
+entropy_bottleneck_weight: da 0.1 a 0.05

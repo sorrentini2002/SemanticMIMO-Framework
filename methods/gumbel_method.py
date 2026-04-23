@@ -3,26 +3,11 @@
 # ============================================================
 # Split-learning method based on Gumbel-Softmax token selection.
 #
-# This file consolidates the logic previously scattered across:
-#   - methods/gumbel/gumbel.py     (Gumbel sampling & ST masks)
-#   - methods/gumbel/core.py       (score-based selection & diversity)
-#   - methods/gumbel/schedules.py  (tau annealing schedules)
-#   - methods/gumbel/utils.py      (gather_tokens helper)
-#
-# The wrapper class (Gumbel_Token_Selection_Block_Wrapper) mirrors
-# the interface of proposal.py's Compress_Batches_and_Select_Tokens_Block_Wrapper,
-# making it a drop-in replacement within the SemanticMIMO framework.
-#
-# Key integration points:
-#   - self.last_adc_scores : [B, N_selected] scores for MIMO waterfilling
-#   - self._model_ref      : back-reference to the outer `model` class
-#   - compress_labels()    : batch-merged soft labels (same as proposal.py)
-#   - clean_validation bypass via self._model_ref.clean_validation
-#
-# Supported channel types (same as proposal.py):
-#   - Gaussian_Noise_Analogic_Channel
-#   - MyMIMOChannel
-#   - CommModuleWrapper (full CommModule pipeline)
+# CHANGELOG (Curriculum Learning Extension):
+#   - Logit Scaling Dinamico:   _compute_logit_scale() + register_epoch()
+#   - Entropy Bottleneck:       max(0, H_actual - H_target(epoch)) loss
+#   - Stability Bonus (EMA):    _selection_freq_ema applied to logits
+#   - Weight decay group tag:   SCORE_HEAD flag for main.py router
 # ============================================================
 
 import math
@@ -36,11 +21,9 @@ from comm.comm_module_wrapper import CommModuleWrapper
 
 logger = logging.getLogger(__name__)
 
-
-# ============================================================
-
 from .gumbel.gumbel import sample_gumbel_topk
 from .gumbel.schedules import compute_tau
+
 
 # ============================================================
 # BLOCK WRAPPER — Gumbel token selection at the split point
@@ -51,334 +34,450 @@ class Gumbel_Token_Selection_Block_Wrapper(nn.Module):
     Wraps a single ViT transformer block and performs Gumbel-Softmax
     token selection after the block's normal forward pass.
 
-    This wrapper follows the same interface contract as
-    ``Compress_Batches_and_Select_Tokens_Block_Wrapper`` in proposal.py:
-
-    - Stores ``last_adc_scores`` (shape [B, N_selected]) for MIMO
-      semantic waterfilling via CommModuleWrapper.
-    - Stores ``_model_ref`` (back-reference to the outer model) so
-      that the ``clean_validation`` flag can be read at eval time.
-    - Exposes ``compress_labels()`` so main.py label handling is compatible.
+    NEW: Curriculum learning through three mechanisms:
+      1. Logit Scaling Dinamico  — alpha_scale ramps from logit_scale_start
+         to logit_scale_end over the full training, letting tau have a real
+         effect only once logits have "matured" beyond noise.
+      2. Entropy Bottleneck      — replaces the old batch-diversity loss.
+         Loss = entropy_bottleneck_weight * max(0, H_actual - H_target(epoch)).
+         H_target decreases from entropy_target_start to entropy_target_end,
+         acting as a soft ceiling that follows the training curriculum.
+      3. Stability Bonus (EMA)   — patches that are consistently selected
+         across batches receive a small logit bonus, reinforcing systematic
+         choices without freezing the distribution.
     """
 
     def __init__(self,
                  block: nn.Module,
                  method_cfg: dict):
-        """
-        Args:
-            block: Original ViT Block (timm) to wrap.
-            method_cfg: Configurazione Hydra passata esplicitamente.
-        """
         super().__init__()
 
         self.block = block
 
         # ----- Mandatory interface variables (SemanticMIMO contract) -----
-        self.last_adc_scores = None          # [B, N_selected] 
+        self.last_adc_scores = None
         object.__setattr__(self, '_model_ref', None)
 
         # ==========================================
-        # ESTRAZIONE PARAMETRI DA HYDRA DICT (CFG)
+        # ARCHITECTURAL PARAMETERS (from Hydra dict)
         # ==========================================
-        
-        # Regole Architetturali Generali
         self.compression_enabled = method_cfg.get('compression_enabled', True)
-        self.token_compression = method_cfg.get('token_compression', 1.0)
-        
-        # Hyper-parametri core Gumbel (Mapping per mantenere le tue logiche)
-        self.tau_max = method_cfg.get('tau_start', 2.0)
-        self.tau_min = method_cfg.get('tau_end', 0.1)
+        self.token_compression    = method_cfg.get('token_compression', 1.0)
+
+        self.tau_max      = method_cfg.get('tau_start', 2.0)
+        self.tau_min      = method_cfg.get('tau_end', 0.1)
         self.anneal_steps = method_cfg.get('steps', 10000)
-        self.anneal_mode = method_cfg.get('schedule', 'linear')
-        self.hard = method_cfg.get('hard', True)
+        self.anneal_mode  = method_cfg.get('schedule', 'linear')
+        self.hard             = method_cfg.get('hard', True)
         self.straight_through = method_cfg.get('straight_through', True)
-        
-        # Flag di Regolarizzazione (per calcolo loss out-of-band)
+
         self.entropy_reg_enabled = method_cfg.get('entropy_reg_enabled', False)
-        self.cov_reg_enabled = method_cfg.get('cov_reg_enabled', False)
-        
-        # Setup per Valutazione / Inferenza
-        self.eval_k = method_cfg.get('eval_k', 32)
+        self.cov_reg_enabled     = method_cfg.get('cov_reg_enabled', False)
+
+        self.eval_k            = method_cfg.get('eval_k', 32)
         self.gumbel_mc_enabled = method_cfg.get('gumbel_mc_enabled', False)
-        self.gumbel_mc_tau = method_cfg.get('gumbel_mc_tau', 0.5)
-        # Costruisce dizionario dinamico per eventuali metodi Diversify
+        self.gumbel_mc_tau     = method_cfg.get('gumbel_mc_tau', 0.5)
         self.diversify_cfg = {
             'enabled': method_cfg.get('diversify_enabled', False),
-            'lambda': method_cfg.get('diversify_lambda', 0.2),
-            'metric': method_cfg.get('diversify_metric', 'cosine')
+            'lambda':  method_cfg.get('diversify_lambda', 0.2),
+            'metric':  method_cfg.get('diversify_metric', 'cosine')
         }
 
-        # Tracking variables
-        self.n_new_tokens = 0
-        self._global_step = 0
+        # ==========================================
+        # CURRICULUM LEARNING PARAMETERS (NEW)
+        # ==========================================
+
+        # --- 1. Logit Scaling Dinamico ---
+        # alpha_scale = logit_scale_start → logit_scale_end over training.
+        # Mode: 'linear', 'cosine', 'exp'
+        # With alpha_scale small at start, tau annealing has no effect (all
+        # logits ≈ 0 → uniform softmax regardless of tau).  As logits mature,
+        # tau starts to matter and the distribution sharpens at a controlled pace.
+        self.logit_scale_start = method_cfg.get('logit_scale_start', 0.1)
+        self.logit_scale_end   = method_cfg.get('logit_scale_end', 1.0)
+        self.logit_scale_mode  = method_cfg.get('logit_scale_mode', 'cosine')
+
+        # --- 2. Entropy Bottleneck ---
+        # Loss = entropy_bottleneck_weight * max(0, H_actual - H_target(epoch))
+        # H_target decreases linearly from entropy_target_start to entropy_target_end.
+        # This creates a soft "ceiling" on entropy that follows the curriculum.
+        # When H_actual < H_target the term is zero (no penalty for being sharp).
+        self.entropy_bottleneck_enabled = method_cfg.get('entropy_bottleneck_enabled', True)
+        self.entropy_target_start   = method_cfg.get('entropy_target_start', 5.2)
+        self.entropy_target_end     = method_cfg.get('entropy_target_end', 2.0)
+        self.entropy_bottleneck_weight = method_cfg.get('entropy_bottleneck_weight', 0.05)
+
+        # --- 3. Stability Bonus (EMA of selection frequencies) ---
+        # After each forward, we update an EMA of which patches were selected.
+        # On the NEXT forward these frequencies are added (scaled) to the logits,
+        # rewarding patches that are systematically useful across batches.
+        self.stability_bonus_enabled   = method_cfg.get('stability_bonus_enabled', False)
+        self.stability_bonus_ema_decay = method_cfg.get('stability_bonus_ema_decay', 0.97)
+        self.stability_bonus_weight    = method_cfg.get('stability_bonus_weight', 0.3)
+        # EMA buffer: shape [num_patches] — initialised lazily on first forward
+        self._selection_freq_ema: torch.Tensor | None = None
+
+        # --- Epoch / total-epoch tracking (set by register_epoch) ---
+        self._current_epoch = 0
+        self._total_epochs  = 1   # updated by training_schedule via register_epoch()
 
         # ==========================================
-        # SIMPLICIAL INTERACTING GRAPH (Branca a bypass dei Gradienti)
+        # STEP-LEVEL TRACKING (unchanged)
         # ==========================================
-        # Estrarre embed_dim in modo sicuro saltando eventuali wrapper:
+        self.n_new_tokens  = 0
+        self._global_step  = 0
+
+        # ==========================================
+        # SIMPLICIAL INTERACTION GRAPH (unchanged)
+        # ==========================================
         if hasattr(block, 'norm1'):
             embed_dim = block.norm1.weight.shape[0]
         else:
-            embed_dim = block.mlp.fc1.in_features  # Fallback
-            
-        # Proiezione per estrarre M_cls (Vettore marginale di contesto)
-        self.w_u = nn.Linear(embed_dim, embed_dim)
-        # Livello di interazione per computare il Triangolo Simpliciale
-        self.w_tri = nn.Linear(embed_dim, embed_dim)
-        # LayerNorm per stabilità locale prima del prodotto
-        self.norm_u = nn.LayerNorm(embed_dim)
-        self.norm_tri = nn.LayerNorm(embed_dim)
-        # Parametro di Forza Bruta inizializzato da config per controllare la polarizzazione dei logits
-        self.gamma = nn.Parameter(torch.tensor(method_cfg.get('gamma_init', 5.0)))
-        self.beta = nn.Parameter(torch.tensor(method_cfg.get('beta_init', 0.0)))
+            embed_dim = block.mlp.fc1.in_features
 
-        # Inizializzatore dizionario diagnostico
+        self.w_u   = nn.Linear(embed_dim, embed_dim)
+        self.w_tri = nn.Linear(embed_dim, embed_dim)
+        nn.init.xavier_uniform_(self.w_u.weight)
+        nn.init.xavier_uniform_(self.w_tri.weight)
+
+        self.beta       = nn.Parameter(torch.tensor(method_cfg.get('beta_init', 1.0)))
+        self.gamma      = nn.Parameter(torch.tensor(method_cfg.get('gamma_init', 1.0)))
+        self.gate_param = nn.Parameter(torch.tensor(method_cfg.get('gate_init', -1.0)))
+
+        self.branch_norm_weight = nn.Parameter(torch.ones(1))
+        self.branch_norm_bias   = nn.Parameter(torch.zeros(1))
+
+        logger.info(
+            f"[GumbelHead] Init: beta={self.beta.item():.2f}, gamma={self.gamma.item():.2f}, "
+            f"gate={self.gate_param.item():.2f} | "
+            f"logit_scale {self.logit_scale_start}→{self.logit_scale_end} ({self.logit_scale_mode}) | "
+            f"entropy_bottleneck={'ON' if self.entropy_bottleneck_enabled else 'OFF'} "
+            f"H_target {self.entropy_target_start}→{self.entropy_target_end} | "
+            f"stability_bonus={'ON' if self.stability_bonus_enabled else 'OFF'}"
+        )
+
+        # Diagnostic stats dict (unchanged keys + new ones)
         self.diagnostic_stats = {
-            "tau": [], "logits_std": [], "logits_mean": [], "entropy": [],
+            "tau": [], "logits_std": [], "logits_mean": [], "logits_max": [], "logits_min": [],
+            "entropy": [], "entropy_target": [], "logit_alpha_scale": [],
             "grad_score_head": [], "grad_backbone": [],
-            "payload_x_norm": [], "payload_out_norm": [], "payload_diff_norm": []
+            "payload_x_norm": [], "payload_out_norm": [], "payload_diff_norm": [],
+            "y_tri_raw_mean": [], "y_tri_raw_std": [],
+            "y_tri_norm_mean": [], "y_tri_norm_std": [],
+            "beta": [], "gamma": [], "gate_sigmoid": [],
+            "base_entropy": [], "batch_entropy": [], "p_max": [],
+            "interaction_norm_check": [],
+            # NEW curriculum keys
+            "stability_ema_max": [], "stability_ema_std": [],
         }
+        print(f"\n[DEBUG] Gumbel Head Initialized. Keys in stats: {list(self.diagnostic_stats.keys())}")
 
     # ------------------------------------------------------------------
-    # Step management
+    # Step / epoch management
     # ------------------------------------------------------------------
 
     def register_step(self, step: int):
         """Update the internal global step counter (used for tau annealing)."""
         self._global_step = step
 
+    def register_epoch(self, epoch: int, total_epochs: int):
+        """
+        Update epoch-level counters used by the curriculum mechanisms:
+          - logit alpha scaling
+          - entropy target H_target(epoch)
+        Called once per epoch from training_schedule() in main.py.
+        """
+        self._current_epoch = epoch
+        self._total_epochs  = max(1, total_epochs)
+
     @property
     def current_tau(self) -> float:
-        """Current Gumbel-Softmax temperature based on the annealing schedule."""
         return compute_tau(
-            self._global_step,
-            self.tau_max,
-            self.tau_min,
-            self.anneal_steps,
-            self.anneal_mode,
+            self._global_step, self.tau_max, self.tau_min,
+            self.anneal_steps, self.anneal_mode,
         )
 
     # ------------------------------------------------------------------
-    # Gumbel token selection  (replaces merge_batches_and_select_tokens)
+    # Curriculum helper methods (NEW)
+    # ------------------------------------------------------------------
+
+    def _curriculum_progress(self) -> float:
+        """Fraction of training completed: 0.0 at epoch 1, 1.0 at final epoch."""
+        return (self._current_epoch - 1) / max(1, self._total_epochs - 1)
+
+    def _compute_logit_scale(self) -> float:
+        """
+        Compute the current alpha_scale for logit scaling.
+
+        The scale is small at the start (logits ≈ 0 → uniform softmax → random
+        selection) and increases as training progresses (logits differentiate →
+        tau annealing starts to matter → selection sharpens).
+
+        Returns a float in [logit_scale_start, logit_scale_end].
+        """
+        t = self._curriculum_progress()          # 0 → 1
+        s, e = self.logit_scale_start, self.logit_scale_end
+
+        if self.logit_scale_mode == 'linear':
+            return s + (e - s) * t
+
+        elif self.logit_scale_mode == 'cosine':
+            # Starts at s, ends at e; uses a reversed cosine (slow start, fast middle)
+            cosine = 0.5 * (1.0 - math.cos(math.pi * t))   # 0→1 (slow at edges)
+            return s + (e - s) * cosine
+
+        elif self.logit_scale_mode == 'exp':
+            # Exponential: s * (e/s)^t  — very slow growth early, fast later
+            if s <= 0:
+                return e * t  # fallback for bad config
+            return s * (e / s) ** t
+
+        return e  # fallback: full scale
+
+    def _compute_entropy_target(self) -> float:
+        """
+        H_target(epoch): soft ceiling on entropy that decreases linearly.
+
+        At epoch 1  → H_target = entropy_target_start  (≈ log(N_patches))
+        At final ep → H_target = entropy_target_end    (≈ 2.0)
+
+        The bottleneck loss max(0, H_actual - H_target) is zero whenever the
+        distribution is sharp enough; it only fires to slow down OVER-uniformity.
+        """
+        t = self._curriculum_progress()
+        return (self.entropy_target_start
+                + (self.entropy_target_end - self.entropy_target_start) * t)
+
+    # ------------------------------------------------------------------
+    # Gumbel token selection
     # ------------------------------------------------------------------
 
     def gumbel_compress(self, x: torch.Tensor) -> torch.Tensor:
         """
         Perform Gumbel-Softmax token selection on the output of the
-        transformer block.
-
-        Steps:
-            1.  Compute CLS-row attention scores from the stored attention.
-            2.  Determine n_alpha (number of patch tokens to keep).
-            3.  Apply Gumbel top-k sampling.
-            4.  Build self.last_adc_scores with shape [B, 1 + n_alpha]:
-                - First position: CLS dummy score = 1.0
-                - Remaining positions: patch scores of selected tokens.
-
-        Args:
-            x: [B, N, D] — tokens after the block forward pass.
-
-        Returns:
-            x_sel: [B, 1 + n_alpha, D] — selected tokens (CLS + top patches).
+        transformer block, with curriculum learning extensions.
         """
         B, N, D = x.shape
         num_patches = N - 1
         device = x.device
 
-        # Number of patch tokens to keep
+        # --- Budget ---
         target_n_alpha = max(1, int(self.token_compression * num_patches))
-        
-        # --- Multi-Budget Training: Vaccinazione Stocastica ---
-        # Durante il training, estraiamo un numero random di token per evitare il "Sequence Length Shock"
         if self.training:
             min_k = min(8, target_n_alpha)
             max_k = min(num_patches, max(64, target_n_alpha * 2))
             n_alpha = torch.randint(min_k, max_k + 1, (1,)).item()
         else:
             n_alpha = target_n_alpha
-            
-        self.n_new_tokens = 1 + n_alpha  # CLS + selected patches
+        self.n_new_tokens = 1 + n_alpha
 
-        # ---- Ritorno all'Attenzione CLS (La 'Gabbia') ----
-        # I punteggi derivano dai pesi di attenzione originali del ViT: 
-        # sono già confinati in [0, 1] perché in uscita da un softmax.
-        cls_attention = self.block.attn.class_token_attention
-        base_patch_scores = cls_attention[:, 1:] # [B, N-1]
+        # --- Base attention scores from CLS row ---
+        cls_attention  = self.block.attn.class_token_attention
+        base_patch_scores = cls_attention[:, 1:]   # [B, N-1]
 
         # ==========================================
-        # 1. SOSTITUZIONE DELLA METRICA (Simplicial Scoring)
+        # 1. SIMPLICIAL SCORING (unchanged)
         # ==========================================
-        # Estraiamo M_cls (il contesto marginale del token di classificazione)
-        cls_token = x[:, 0:1, :] # [B, 1, D]
-        patch_tokens = x[:, 1:, :] # [B, N-1, D]
-        
-        # Calcoliamo le proiezioni per l'interazione
-        # [B, 1, D]
-        m_cls = self.norm_u(self.w_u(cls_token))
-        # [B, N-1, D]
-        patch_tri = self.norm_tri(self.w_tri(patch_tokens))
-        
-        # Interazione: calcoliamo il peso simpliciale s_j^{tri}
-        # Multi_Head attention interaction approssimata combinando la magnitudo L2
-        # per "rigonfiare" artificialmente l'attenzione piatta.
-        
-        # Magnitudo dell'interazione [B, N-1]
-        interaction_strength = torch.norm(m_cls * patch_tri, p=2, dim=-1)
-        
-        # Interazione base (senza gamma prepensato, applicato post-standardizzazione)
-        simplicial_scores = base_patch_scores * (1.0 + interaction_strength)
-        
+        cls_token    = x[:, 0:1, :]    # [B, 1, D]
+        patch_tokens = x[:, 1:, :]     # [B, N-1, D]
+
+        m_cls     = self.w_u(cls_token)       # [B, 1, D]
+        patch_tri = self.w_tri(patch_tokens)  # [B, N-1, D]
+
+        y_tri_raw  = torch.norm(m_cls * patch_tri, p=2, dim=-1)   # [B, N-1]
+        y_tri_norm = F.layer_norm(y_tri_raw, y_tri_raw.shape[-1:])
+        y_tri      = y_tri_norm * self.branch_norm_weight + self.branch_norm_bias
+
+        x_std       = base_patch_scores
+        raw_logits  = (self.beta * x_std) + (torch.sigmoid(self.gate_param) * self.gamma * y_tri)
+
         # ==========================================
-        # 1. Eliminazione totale L1 Norm / Logaritmo
-        # 2. Implementazione Z-Score Standardization + Trasformazione Affine
+        # 2. LOGIT SCALING DINAMICO (NEW)
         # ==========================================
-        # Forniamo Energie pure / Raw Logits
-        sm_mean = simplicial_scores.mean(dim=-1, keepdim=True)
-        sm_std = simplicial_scores.std(dim=-1, keepdim=True)
-        # Forza media 0 e varianza 1 lungo la dimensione spaziale (token)
-        standardized_scores = (simplicial_scores - sm_mean) / (sm_std + 1e-9)
+        # During training, scale logits by a curriculum ramp so the network
+        # starts with near-uniform logits (random selection) and only develops
+        # discriminative power once the backbone has learned useful features.
+        # At eval time, we use full scale (alpha_scale = 1.0).
+        if self.training:
+            alpha_scale = self._compute_logit_scale()
+        else:
+            alpha_scale = 1.0
 
-        # Trasformazione Affine Apprendibile: Ripristina la capacità di gridare del segnale
-        final_logits = self.gamma * standardized_scores + self.beta
+        final_logits = raw_logits * alpha_scale   # [B, N-1]
 
-        # Per il p_mean della regularization/entropy calcoliamo un softmax esplorativo
-        patch_scores_probs = F.softmax(final_logits, dim=-1)
+        # ==========================================
+        # 3. STABILITY BONUS — apply EMA from PREVIOUS batches (NEW)
+        # ==========================================
+        # The EMA is updated AFTER selection (below), so here we use the
+        # bonus computed during the previous forward.  This avoids a chicken-
+        # and-egg problem while still reinforcing systematic selections.
+        if self.stability_bonus_enabled and self._selection_freq_ema is not None:
+            ema = self._selection_freq_ema.to(device=device, dtype=final_logits.dtype)
+            if ema.shape[0] == num_patches:
+                # Center the EMA so neutral patches get 0 bonus, not a uniform lift
+                ema_centered = ema - ema.mean()
+                final_logits = final_logits + self.stability_bonus_weight * ema_centered.unsqueeze(0)
 
-        # ---- Gumbel select directly from imported module ----
-        tau = self.current_tau
+        # Soft probabilities (for entropy computation and ADC scores)
+        patch_scores_probs = F.softmax(final_logits, dim=-1)   # [B, N-1]
 
-        # -- Pre-Channel Batch Entropy Regularization (Spatial Diversity) --
-        # 1. Passaggio alla Batch Entropy: calcoliamo la distribuzione media sul batch
-        # per evitare l'Index Collapse, permettendo però alla rete di polarizzarsi 
-        # (sharpness alta) sulla singola istanza/immagine individualmente.
-        p_mean = patch_scores_probs.mean(dim=0)
-        entropy_reg_loss = -torch.sum(p_mean * torch.log(p_mean + 1e-9))
-        self.entropy_reg_loss = entropy_reg_loss
+        # ==========================================
+        # 4. ENTROPY BOTTLENECK LOSS (NEW — replaces batch entropy maximization)
+        # ==========================================
+        # Loss_ent = entropy_bottleneck_weight * max(0, H_actual - H_target(epoch))
+        #
+        # Semantics:
+        #   • When H_actual > H_target  → distribution is too uniform for this
+        #     stage of training → push it down gently.
+        #   • When H_actual < H_target  → distribution has legitimately sharpened
+        #     → loss is zero, no interference with classification gradient.
+        #
+        # H_target decreases from entropy_target_start to entropy_target_end so
+        # the "allowed" uniformity shrinks progressively with the curriculum.
+        if self.entropy_bottleneck_enabled and self.training:
+            # Instance-level entropy, averaged over batch
+            H_actual = -(patch_scores_probs * torch.log(patch_scores_probs + 1e-9)).sum(dim=-1).mean()
+            H_target_val = self._compute_entropy_target()
+            # max(0, H_actual - H_target): penalise only over-uniformity
+            entropy_ceiling_loss = torch.clamp(H_actual - H_target_val, min=0.0)
+            self.entropy_reg_loss = self.entropy_bottleneck_weight * entropy_ceiling_loss
+            # Expose scalar for diagnostics
+            self._last_H_actual  = H_actual.item()
+            self._last_H_target  = H_target_val
+        else:
+            # Fallback: keep the old batch-diversity term (or zero when not training)
+            p_mean = patch_scores_probs.mean(dim=0)
+            batch_entropy = -torch.sum(p_mean * torch.log(p_mean + 1e-9))
+            self.entropy_reg_loss = batch_entropy
+            self._last_H_actual  = batch_entropy.item()
+            self._last_H_target  = float('nan')
 
-        # =====================================================================
-        # DIAGNOSTICS PHASE 1 & 2: Sharpness, Temperature, & STE Gradient Audit
-        # =====================================================================
+        # ==========================================
+        # DIAGNOSTICS PHASE 1 & 2 (extended)
+        # ==========================================
         if hasattr(self, "diagnostic_stats") and self.training:
-            # 1. Log Temperature and Sharpness
+            tau = self.current_tau
             self.diagnostic_stats["tau"].append(tau)
             self.diagnostic_stats["logits_std"].append(final_logits.std().item())
             self.diagnostic_stats["logits_mean"].append(final_logits.mean().item())
-            
-            # L'entropia matematica H = -sum(p * log p)
-            entropy_val = -torch.sum(patch_scores_probs * torch.log(patch_scores_probs + 1e-9), dim=-1).mean()
-            self.diagnostic_stats["entropy"].append(entropy_val.item())
+            self.diagnostic_stats["logits_max"].append(final_logits.max().item())
+            self.diagnostic_stats["logits_min"].append(final_logits.min().item())
+            self.diagnostic_stats["p_max"].append(patch_scores_probs.max().item())
 
-            # 2. Registrazione Hooks per Audit del Gradiente STE
+            H_inst = -(patch_scores_probs * torch.log(patch_scores_probs + 1e-9)).sum(dim=-1).mean()
+            self.diagnostic_stats["entropy"].append(H_inst.item())
+            self.diagnostic_stats["entropy_target"].append(self._last_H_target)
+            self.diagnostic_stats["logit_alpha_scale"].append(alpha_scale)
+
+            # Batch diversity entropy (kept for monitoring even when not used as loss)
+            p_mean_diag = patch_scores_probs.mean(dim=0)
+            batch_ent_val = -torch.sum(p_mean_diag * torch.log(p_mean_diag + 1e-9))
+            self.diagnostic_stats["batch_entropy"].append(batch_ent_val.item())
+
+            p_base = base_patch_scores / (base_patch_scores.sum(dim=-1, keepdim=True) + 1e-9)
+            ent_base = -torch.sum(p_base * torch.log(p_base + 1e-9), dim=-1).mean()
+            self.diagnostic_stats["base_entropy"].append(ent_base.item())
+
+            self.diagnostic_stats["y_tri_raw_mean"].append(y_tri_raw.mean().item())
+            self.diagnostic_stats["y_tri_raw_std"].append(y_tri_raw.std().item())
+            self.diagnostic_stats["y_tri_norm_mean"].append(y_tri_norm.mean().item())
+            self.diagnostic_stats["y_tri_norm_std"].append(y_tri_norm.std().item())
+            self.diagnostic_stats["beta"].append(self.beta.item())
+            self.diagnostic_stats["gamma"].append(self.gamma.item())
+            self.diagnostic_stats["gate_sigmoid"].append(torch.sigmoid(self.gate_param).item())
+            self.diagnostic_stats["interaction_norm_check"].append(y_tri_norm.std().item())
+
+            if self._selection_freq_ema is not None:
+                ema_buf = self._selection_freq_ema
+                self.diagnostic_stats["stability_ema_max"].append(ema_buf.max().item())
+                self.diagnostic_stats["stability_ema_std"].append(ema_buf.std().item())
+
             if final_logits.requires_grad:
-                final_logits.register_hook(lambda g: self.diagnostic_stats["grad_score_head"].append(g.norm().item()))
+                final_logits.register_hook(
+                    lambda g: self.diagnostic_stats["grad_score_head"].append(g.norm().item())
+                )
             if x.requires_grad:
-                x.register_hook(lambda g: self.diagnostic_stats["grad_backbone"].append(g.norm().item()))
-        # =====================================================================
+                x.register_hook(
+                    lambda g: self.diagnostic_stats["grad_backbone"].append(g.norm().item())
+                )
+
+        # ==========================================
+        # 5. GUMBEL SELECTION (unchanged logic)
+        # ==========================================
+        tau = self.current_tau
 
         tokens_sel, indices_sel, patch_scores, gs_tau = sample_gumbel_topk(
             tokens=x,
-            scores=final_logits,  # PASS AFFINE TRANSFORMED LOGITS
+            scores=final_logits,
             n_alpha=n_alpha,
             tau=tau,
             hard=self.hard,
             straight_through=self.straight_through,
             generator=None,
         )
-        # tokens_sel : [B, 1 + n_alpha, D]
-        # patch_scores : [B, num_patches]
 
-        # ---- Build last_adc_scores for MIMO waterfilling ----
-        # Shape must be [B, 1 + n_alpha].
-        # Position 0  → CLS dummy score = 1.0
-        # Positions 1…n_alpha → patch scores of the *selected* patches.
-        #
-        # indices_sel[:, 1:] are global indices (1..N-1) of the kept patches.
-        # patch_scores indices are 0..N-2.  So we need: patch_scores[:, idx-1].
-        selected_patch_indices = indices_sel[:, 1:] - 1                    # [B, n_alpha], 0-based
-        selected_patch_scores = torch.gather(patch_scores_probs, 1, selected_patch_indices)  # [B, n_alpha]
+        # ==========================================
+        # 6. UPDATE STABILITY EMA (NEW)
+        # ==========================================
+        # Must happen AFTER selection so the EMA reflects actual selections.
+        # We build a hard binary mask [B, N-1] from indices_sel.
+        if self.stability_bonus_enabled and self.training:
+            with torch.no_grad():
+                relative_sel = indices_sel[:, 1:] - 1              # [B, n_alpha] 0-based
+                hard_mask = torch.zeros(B, num_patches, device=device)
+                hard_mask.scatter_(1, relative_sel.clamp(0, num_patches - 1), 1.0)
+                batch_freq = hard_mask.mean(dim=0)                  # [N-1]
 
+                if self._selection_freq_ema is None or self._selection_freq_ema.shape[0] != num_patches:
+                    self._selection_freq_ema = batch_freq.cpu()
+                else:
+                    d = self.stability_bonus_ema_decay
+                    self._selection_freq_ema = (
+                        d * self._selection_freq_ema + (1.0 - d) * batch_freq.cpu()
+                    )
+
+        # ==========================================
+        # 7. BUILD last_adc_scores (unchanged)
+        # ==========================================
+        selected_patch_indices = indices_sel[:, 1:] - 1
+        selected_patch_scores  = torch.gather(patch_scores_probs, 1, selected_patch_indices)
         cls_dummy = torch.ones((B, 1), dtype=selected_patch_scores.dtype, device=device)
-        self.last_adc_scores = torch.cat([cls_dummy, selected_patch_scores], dim=1)  # [B, 1 + n_alpha]
-        
-        # --- Store indices for Server Spatial Reconstruction ---
+        self.last_adc_scores  = torch.cat([cls_dummy, selected_patch_scores], dim=1)
         self.last_indices_sel = indices_sel
-        self.last_original_N = N
-
-        # NOTE: tokens_sel are already masked by sample_gumbel_topk (STE logic inside gumbel.py)
+        self.last_original_N  = N
 
         return tokens_sel
 
-
-
     # ------------------------------------------------------------------
-    # forward
+    # forward (unchanged)
     # ------------------------------------------------------------------
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Full forward pass:
-            1. Run the original transformer block (attention + MLP).
-            2. Check for clean_validation bypass.
-            3. If not bypassed, apply Gumbel token selection (and
-               optional batch merging).
-
-        Args:
-            x: [B, N, D]
-
-        Returns:
-            [B_out, N_out, D] where B_out / N_out depend on
-            compression settings.
-        """
-        # --- Original block forward (attention + MLP) ---
         x = x + self.block.drop_path1(self.block.ls1(self.block.attn(self.block.norm1(x))))
         x = x + self.block.drop_path2(self.block.ls2(self.block.mlp(self.block.norm2(x))))
 
-        # --- Clean validation bypass (Rule 4) ---
         clean_val = False
         if not self.training and self._model_ref is not None:
             clean_val = getattr(self._model_ref, 'clean_validation', False)
 
         if self.compression_enabled and not clean_val:
-            # Apply Gumbel token compression
             x = self.gumbel_compress(x)
 
-        # If clean_val is True or compression_enabled is False, x passes through unmodified (no compression)
         return x
 
     # ------------------------------------------------------------------
-    # compress_labels  (for main.py compatibility)
+    # compress_labels  (unchanged)
     # ------------------------------------------------------------------
 
     def compress_labels(self, labels: torch.Tensor, num_classes: int) -> torch.Tensor:
-        """
-        Merge labels to match predictions.
-        Since Gumbel natively does not compress batches, we simply return
-        the one-hot encoded labels.
-
-        Args:
-            labels:      [B] — integer class labels.
-            num_classes: int — total number of classes.
-
-        Returns:
-            new_labels: [B, num_classes] (standard one-hot).
-        """
         return F.one_hot(labels, num_classes=num_classes).float()
 
 
 # ============================================================
-# Store_Class_Token_Attn_Wrapper  (same as proposal.py)
+# Store_Class_Token_Attn_Wrapper  (unchanged)
 # ============================================================
 
 class Store_Class_Token_Attn_Wrapper(nn.Module):
-    """
-    Thin wrapper around a timm Attention module that stores the
-    CLS-row attention scores (averaged across heads) after every
-    forward pass.
-
-    Attribute ``class_token_attention`` has shape [B, N] and is
-    consumed by the Gumbel block wrapper to rank patch tokens.
-    """
-
     def __init__(self, attn):
         super().__init__()
         self.attn = attn
@@ -387,24 +486,18 @@ class Store_Class_Token_Attn_Wrapper(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, N, C = x.shape
 
-        # QKV projection
         qkv = (self.attn.qkv(x)
                .reshape(B, N, 3, self.attn.num_heads, self.attn.head_dim)
                .permute(2, 0, 3, 1, 4))
         q, k, v = qkv.unbind(0)
         q, k = self.attn.q_norm(q), self.attn.k_norm(k)
 
-        # Scaled dot-product
-        q = q * self.attn.scale
+        q    = q * self.attn.scale
         attn = q @ k.transpose(-2, -1)
         attn = attn.softmax(dim=-1)
 
-        # Store CLS-row attention averaged across heads  →  [B, N]
-        # NOTE: Do NOT detach here — gradient must flow through scores
-        # to the QKV weights for Gumbel-Softmax STE to learn a selection policy.
-        self.class_token_attention = attn[:, :, 0, :].mean(dim=1)
+        self.class_token_attention = attn[:, :, 0, :].mean(dim=1)   # [B, N]
 
-        # Normal attention output
         attn = self.attn.attn_drop(attn)
         attn_output = attn @ v
         x = attn_output.transpose(1, 2).reshape(B, N, C)
@@ -414,18 +507,10 @@ class Store_Class_Token_Attn_Wrapper(nn.Module):
 
 
 # ============================================================
-# OUTER MODEL  — mirrors proposal.py's `model` class
+# OUTER MODEL  (minimal changes: exposes register_epoch)
 # ============================================================
 
 class model(nn.Module):
-    """
-    Top-level split-learning model that uses Gumbel-Softmax token
-    selection at the split point.
-
-    Constructor signature is identical to proposal.py so that Hydra
-    can instantiate it transparently.
-    """
-
     def __init__(self,
                  model: VisionTransformer,
                  channel,
@@ -435,21 +520,18 @@ class model(nn.Module):
         super().__init__(*args, **kwargs)
 
         self.method_cfg = method_cfg
-        
-        # ---- Arch Flags ----
+
         compression_enabled = method_cfg.get('compression_enabled', True)
         desired_compression = method_cfg.get('desired_compression', None)
-        token_compression = method_cfg.get('token_compression', 1.0)
-        self.channel_eval_only = method_cfg.get('channel_eval_only', False)
+        token_compression   = method_cfg.get('token_compression', 1.0)
+        self.channel_eval_only    = method_cfg.get('channel_eval_only', False)
         self.semantic_waterfilling = method_cfg.get('semantic_waterfilling', True)
 
-        # ---- Resolve compression rates ----
         if not compression_enabled:
             self.compression_ratio = 1.0
         else:
             if desired_compression is not None:
-                assert token_compression is None or token_compression == 1.0, \
-                    "When desired_compression is set, token_compression should be None"
+                assert token_compression is None or token_compression == 1.0
                 self.compression_ratio = desired_compression
                 self.method_cfg['token_compression'] = desired_compression
             else:
@@ -458,73 +540,40 @@ class model(nn.Module):
                 self.compression_ratio = token_compression
                 self.method_cfg['token_compression'] = token_compression
 
-        # Will be assigned inside build_model
         self.compressor_module = None
-        self.clean_validation = False
+        self.clean_validation  = False
 
-        # ---- Build model ----
-        self.model = self.build_model(
-            model, channel, split_index,
-            self.method_cfg
-        )
-
-        # Store channel reference
+        self.model = self.build_model(model, channel, split_index, self.method_cfg)
         self.channel = channel
-
-        # Communication cost tracker (same as proposal.py)
         self.communication = 0
-
-        # Method name
         self.name = "GumbelMethod"
 
     # ------------------------------------------------------------------
-    # build_model
+    # build_model (unchanged)
     # ------------------------------------------------------------------
 
-    def build_model(self,
-                    model: VisionTransformer,
-                    channel,
-                    split_index: int,
-                    method_cfg: dict):
-        """
-        Assemble the split-learning pipeline.
-        """
-
-        # --- Wrap attention to expose CLS scores ---
+    def build_model(self, model, channel, split_index, method_cfg):
         model.blocks[split_index - 1].attn = Store_Class_Token_Attn_Wrapper(
             model.blocks[split_index - 1].attn
         )
-
-        # --- Wrap the block with Gumbel token selection ---
         model.blocks[split_index - 1] = Gumbel_Token_Selection_Block_Wrapper(
             block=model.blocks[split_index - 1],
             method_cfg=method_cfg
         )
         self.compressor_module = model.blocks[split_index - 1]
 
-        # Wire the back-reference so the wrapper can read clean_validation.
-        # Use object.__setattr__ to avoid nn.Module registering the parent
-        # as a sub-module (which would cause infinite recursion).
         object.__setattr__(self.compressor_module, '_model_ref', weakref.proxy(self))
 
-        # --- Split into client / server blocks ---
-        blocks_before = model.blocks[:split_index]    # client
-        blocks_after  = model.blocks[split_index:]    # server
+        blocks_before = model.blocks[:split_index]
+        blocks_after  = model.blocks[split_index:]
+        model.blocks  = nn.Sequential(*blocks_before, channel, *blocks_after)
 
-        # --- Insert channel ---
-        model.blocks = nn.Sequential(*blocks_before, channel, *blocks_after)
-
-        # --- Wire scores → CommModuleWrapper ---
         if isinstance(channel, CommModuleWrapper):
             channel.set_score_source(self.compressor_module)
-            # Apply eval-only channel mode if requested
             if hasattr(channel, "set_channel_eval_only"):
                 channel.set_channel_eval_only(self.channel_eval_only)
-            # Toggle semantic waterfilling
             if hasattr(channel, "set_semantic_waterfilling"):
                 channel.set_semantic_waterfilling(self.semantic_waterfilling)
-            
-            # Disable bottleneck if compression is disabled
             compression_enabled = method_cfg.get('compression_enabled', True)
             if not compression_enabled and hasattr(channel, "comm"):
                 channel.comm.use_bottleneck = False
@@ -532,7 +581,7 @@ class model(nn.Module):
         return model
 
     # ------------------------------------------------------------------
-    # forward
+    # forward (unchanged)
     # ------------------------------------------------------------------
 
     def forward(self, x: torch.Tensor):

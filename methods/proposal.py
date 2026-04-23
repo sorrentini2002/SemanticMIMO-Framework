@@ -1,7 +1,7 @@
 # ============================================================
 # methods/proposal.py
 # ============================================================
-# Split-learning proposal: compresses batches + selects tokens
+# Split-learning proposal: selects tokens
 # at the split point, then passes features through the channel.
 #
 # Supported channel types (passed via Hydra cfg.communication):
@@ -14,7 +14,6 @@
 from timm.models import VisionTransformer
 import torch.nn as nn
 import torch
-from kmeans_pytorch import kmeans
 import torch.nn.functional as F
 
 # --- Import the advanced MIMO channel wrapper ---
@@ -23,10 +22,10 @@ import torch.nn.functional as F
 from comm.comm_module_wrapper import CommModuleWrapper
 
 
-# Block used by our proposal to compress batches and select tokens
-class Compress_Batches_and_Select_Tokens_Block_Wrapper(nn.Module):
+# Block used by our proposal to select tokens
+class Token_Selection_Block_Wrapper(nn.Module):
 
-    def __init__(self, block, batch_compression, token_compression, pooling='attention'):
+    def __init__(self, block, token_compression, pooling='attention'):
         super().__init__()
 
         assert pooling in ['attention', 'average', 'cls'], (f"Pooling must be either in "
@@ -35,127 +34,81 @@ class Compress_Batches_and_Select_Tokens_Block_Wrapper(nn.Module):
 
         self.block = block
 
-        # Store the clusters for label reconstruction
-        self.cluster_ids = None
-
         # Store compression rates 
-        self.batch_compression = batch_compression
         self.token_compression = token_compression
 
-        self.n_new_batches = 0
         self.n_new_tokens = 0
 
         self.pooling = pooling
         self.last_adc_scores = None
 
-    def merge_batches_and_select_tokens(self, x: torch.Tensor) -> torch.Tensor:
+        # Reference to parent model to read clean_validation flag
+        self._model_ref = None
 
+        # Diagnostic stats for channel integrity monitoring
+        self.diagnostic_stats = {
+            "payload_x_norm": [], 
+            "payload_out_norm": [], 
+            "payload_diff_norm": []
+        }
+
+    def select_tokens(self, x: torch.Tensor) -> torch.Tensor:
         # Get input dimensions 
-        n_batches, n_tokens, _ = x.size()
+        n_batches, n_tokens, hidden_dim = x.size()
 
-        # Compute the new number of token and batches 
+        # Compute the new number of tokens
         self.n_new_tokens = max(1, int(self.token_compression * n_tokens))
-        self.n_new_batches = max(2, int(self.batch_compression * n_batches))
-
+        
         # Store device
         device = x.device
 
-        # Get the class token attention of the batch
+        # Get the token scores based on the pooling strategy
         if self.pooling == 'attention':
-            class_token_attention = self.block.attn.class_token_attention  # n_batches x hidden_dim
+            # class_token_attention has shape [n_batches, n_tokens]
+            # We take scores for patch tokens (excluding CLS at index 0)
+            scores = self.block.attn.class_token_attention[:, 1:]
         elif self.pooling == 'average':
-            class_token_attention = x.mean(1)
-        else:
-            class_token_attention = x[:, 0]
+            scores = x[:, 1:].mean(dim=-1)
+        else: # 'cls'
+            scores = x[:, 1:].abs().mean(dim=-1)
 
-        # Do K means clustering 
-        with torch.no_grad():
-            cluster_ids, centroids = kmeans(X=class_token_attention,
-                                            num_clusters=self.n_new_batches,
-                                            distance='euclidean',
-                                            tol=1e-4,
-                                            iter_limit=50,
-                                            device=device,
-                                            tqdm_flag=False
-                                            )
+        # Select top-k tokens for each image in the batch
+        # scores: [B, N-1]
+        top_k = torch.topk(scores, k=self.n_new_tokens - 1, dim=1, largest=True, sorted=False)
+        top_k_indices = top_k.indices # [B, n_new_tokens - 1]
+        
+        # Prepend CLS token index (0) to each selection
+        cls_idx = torch.zeros((n_batches, 1), dtype=torch.long, device=device)
+        full_indices = torch.cat([cls_idx, top_k_indices + 1], dim=1) # [B, n_new_tokens]
 
-        # Make sure these are plain tensors
-        self.cluster_ids = cluster_ids.detach().to(device)
-        centroids = centroids.detach().to(device)
+        # Gather selected tokens: [B, n_new_tokens, hidden_dim]
+        batch_indices = torch.arange(n_batches, device=device).view(-1, 1)
+        output = x[batch_indices, full_indices]
 
-        # Create variable to store output
-        clustered_activations = []
-        clustered_scores = []
-
-        # For each cluster 
-        for cluster_id in range(self.n_new_batches):
-            # Get the activations that belong to that cluster
-            mask = cluster_ids == cluster_id
-            cluster_activations = x[mask]
-
-            # Get the average activation 
-            average_activation = cluster_activations.mean(dim=0)
-
-            # Get the attention centroid that represents the cluster 
-            cluster_class_token_attention = centroids[cluster_id, 1:]
-
-            # Select the top k tokens and keep them 
-            top_k_tokens = torch.topk(cluster_class_token_attention, k=self.n_new_tokens - 1, largest=True,
-                                      sorted=False).indices
-            top_k_tokens_indexes = torch.cat([torch.zeros(1, dtype=torch.long, device=device), top_k_tokens + 1])
-
-            # Create the new activation 
-            clustered_activations.append(average_activation[top_k_tokens_indexes, :])
-
-            # Keep the scores of the selected tokens for MIMO stream/power allocation
-            # top_k_tokens contains the indices into the patch scores.
-            sel_patch_scores = cluster_class_token_attention[top_k_tokens]
-            # Prepend a dummy 1.0 score for the CLS token to match shape [n_new_tokens]
-            cls_score = torch.ones(1, dtype=sel_patch_scores.dtype, device=device)
-            clustered_scores.append(torch.cat([cls_score, sel_patch_scores]))
-
-        # Stack on the batch dimension to get the output
-        output = torch.stack(clustered_activations, dim=0)
-        self.last_adc_scores = torch.stack(clustered_scores, dim=0)  # [n_new_batches, n_new_tokens]
+        # Keep the scores of the selected tokens for MIMO stream/power allocation
+        # We need scores for all selected tokens including CLS (dummy 1.0)
+        cls_scores = torch.ones((n_batches, 1), dtype=top_k.values.dtype, device=device)
+        self.last_adc_scores = torch.cat([cls_scores, top_k.values], dim=1) # [B, n_new_tokens]
+        
+        # Store indices for Server Spatial Reconstruction
+        self.last_indices_sel = full_indices
 
         return output
-
+    
     def forward(self, x: torch.Tensor) -> torch.Tensor:
 
         # Normal block forward 
         x = x + self.block.drop_path1(self.block.ls1(self.block.attn(self.block.norm1(x))))
         x = x + self.block.drop_path2(self.block.ls2(self.block.mlp(self.block.norm2(x))))
-        if self.training:
-            # Apply ADC in train to have consistent communication/compression
-            # statistics across training.
-            x = self.merge_batches_and_select_tokens(x)
+
+        # Always apply token selection
+        x = self.select_tokens(x)
 
         return x
 
-    # Function to handle the merging of lables (since we merge batches)
+    # Function to handle the conversion of labels to one-hot (no merging)
     def compress_labels(self, labels, num_classes) -> torch.Tensor:
-
-        # Get number of clusters
-        clusters_ids = self.n_new_batches
-        new_labels = []
-
-        # For each cluster 
-        for clusters_id in range(clusters_ids):
-            # Transform to one hot labels, n_batches x num_classes
-            one_hot_labels = F.one_hot(labels, num_classes=num_classes).float()
-
-            # Get the labels that belong to the cluster
-            mask = self.cluster_ids == clusters_id
-            cluster_labels = one_hot_labels[mask]
-
-            # Average them and append 
-            cluster_average_label = cluster_labels.mean(dim=0)
-            new_labels.append(cluster_average_label)
-
-            # Stack on the batch dimension
-        new_labels = torch.stack(new_labels, dim=0)
-
-        return new_labels
+        return F.one_hot(labels, num_classes=num_classes).float()
 
 
 # An attention class that stores class token attention scores
@@ -193,35 +146,15 @@ class model(nn.Module):
                  model: VisionTransformer,
                  channel,
                  split_index,
-                 desired_compression=None,
-                 batch_compression=None,
                  token_compression=None,
                  pooling='attention',
                  *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        if desired_compression is None:
-            if batch_compression is not None and token_compression is not None:
-                compression = (batch_compression, token_compression)
-                self.compression_ratio = batch_compression * token_compression
-            elif batch_compression is not None:
-                # Single explicit rate -> use automatic split sqrt(rate) x sqrt(rate)
-                compression = batch_compression
-                self.compression_ratio = batch_compression
-            elif token_compression is not None:
-                # Single explicit rate -> use automatic split sqrt(rate) x sqrt(rate)
-                compression = token_compression
-                self.compression_ratio = token_compression
-            else:
-                raise ValueError(
-                    'Set either desired_compression or at least one between '
-                    'batch_compression/token_compression'
-                )
+        if token_compression is not None:
+            self.compression_ratio = token_compression
         else:
-            assert batch_compression is None and token_compression is None, \
-                'When desired_compression is set, batch_compression and token_compression must be None'
-            compression = desired_compression
-            self.compression_ratio = desired_compression
+            raise ValueError('Set token_compression')
 
         self.compressor_module = None
 
@@ -229,10 +162,21 @@ class model(nn.Module):
 
 
         # Build model 
-        self.model = self.build_model(model, channel, split_index, compression, pooling)
+        self.model = self.build_model(model, channel, split_index, self.compression_ratio, pooling)
 
         # Store channel 
         self.channel = channel
+
+        # Store the split index so we can bypass the channel during eval
+        self.split_index = split_index
+
+        # Clean validation flag: when True, skip ADC + channel during eval.
+        # Default is False (noisy validation = ADC + channel active).
+        self.clean_validation = False
+
+        # Wire the flag reference to the compressor block
+        if self.compressor_module is not None:
+            self.compressor_module._model_ref = [self]
 
         # Variable to store communication 
         self.communication = 0
@@ -247,17 +191,8 @@ class model(nn.Module):
                     model,
                     channel,
                     split_index,
-                    compression,
+                    token_compression,
                     pooling):
-
-        # --- Resolve batch / token compression rates ---
-        # If a tuple is given, unpack directly.
-        # Otherwise treat the scalar as the square root of both rates.
-        if isinstance(compression, tuple):
-            batch_compression, token_compression = compression
-        else:
-            batch_compression = compression ** (1 / 2)
-            token_compression = compression ** (1 / 2)
 
         # --- Wrap the attention module at split_index-1 ---
         # Stores class-token attention scores used for token selection.
@@ -265,10 +200,9 @@ class model(nn.Module):
             model.blocks[split_index - 1].attn
         )
 
-        # --- Wrap the full block with batch+token compression ---
-        model.blocks[split_index - 1] = Compress_Batches_and_Select_Tokens_Block_Wrapper(
+        # --- Wrap the full block with token selection ---
+        model.blocks[split_index - 1] = Token_Selection_Block_Wrapper(
             model.blocks[split_index - 1],
-            batch_compression,
             token_compression,
             pooling=pooling,
         )
@@ -299,4 +233,27 @@ class model(nn.Module):
         batch_size = x.shape[0]
         if self.training:
             self.communication += self.compression_ratio * batch_size
-        return self.model.forward(x)
+            return self.model.forward(x)
+
+        # --- Eval mode ---
+        if self.clean_validation:
+            # Clean validation: bypass both ADC (handled in the block)
+            # and the channel layer entirely.
+            x = self.model.patch_embed(x)
+            x = self.model._pos_embed(x)
+            x = self.model.patch_drop(x)
+            x = self.model.norm_pre(x)
+
+            blocks = self.model.blocks
+            for i in range(self.split_index):
+                x = blocks[i](x)
+            # Skip blocks[split_index] which is the channel
+            for i in range(self.split_index + 1, len(blocks)):
+                x = blocks[i](x)
+
+            x = self.model.norm(x)
+            x = self.model.forward_head(x)
+            return x
+        else:
+            # Noisy validation: normal forward (ADC + channel active)
+            return self.model.forward(x)

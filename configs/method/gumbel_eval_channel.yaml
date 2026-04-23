@@ -16,8 +16,9 @@ parameters:
   steps: 10000
   hard: true
   straight_through: true
-  gamma_init: 5.0
-  beta_init: 0.0
+  gamma_init: 2.0
+  beta_init: 1.0
+  gate_init: -1.0
   
   # --- LOSS / REGULARIZATION (Algoritmico) ---
   entropy_reg_enabled: true

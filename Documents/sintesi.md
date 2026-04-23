@@ -1,8 +1,19 @@
-# Update - Comparison between random selection and Gumbel-Softmax selection for different compression levels
+# Update 23/04 - Comparison with the selection of top k tokens based on their CLS token attention weights
+
+To contestualize the results, we compared the Gumbel-Softmax selection with a greedy approach: selecting the top k tokens based on their CLS token attention weights.
+
+At the same time, the gumbel-softmax method was improved under the management of probability of selection with the introduction of an entropy bottleneck.
+
+The plots below show the comparison across different SNR regimes:
+
+![Comparison between random selection, Gumbel-Softmax selection and top-k CLS token selection for different SNR regimes](../Plots/baseline/plt11.png)
+
+
+# Update 21/04 - Comparison between random selection and Gumbel-Softmax selection for different compression levels
 
 To more concretely investigate the differences between the two methods, we tested various scenarios to observe how the two techniques vary depending on the number of tokens being transmitted. The following charts show the comparison across different SNR regimes:
 
-![Trade-off between compression and accuracy for different SNR regimes](../Plots/baseline/plt10.png)
+![Trade-off between compression and accuracy for different SNR regimes](../Plots/baseline/plt10.png) |
 
 
 # Experimental Results Overview

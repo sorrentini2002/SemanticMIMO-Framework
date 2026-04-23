@@ -254,3 +254,16 @@ The training objective was unified in `main.py` into a single, cohesive calculat
 
 #### 17. Index Synchronization
 The CommModuleWrapper now extracts last_indices_sel from the Gumbel selector and passes it to the CommModule. This enables Unequal Error Protection (UEP): tokens deemed most important by the Gumbel branch are now physically routed through the most robust MIMO spatial streams (those associated with the highest singular values).
+
+#### 18. Dynamic Logit Scaling (`_compute_logit_scale()`)
+Implements a cosine-based scaling factor $\alpha$ (growing from 0.1 to 1.0) applied to raw logits. This prevents early entropy collapse by counteracting low initial weight magnitudes, ensuring a controlled transition from random exploration to sharp, semantically-driven selection.
+
+#### 19. Per-Instance Entropy Bottleneck
+Replaced batch-entropy maximization with a "moving ceiling" loss: $Loss_{ent} = \lambda \cdot \max(0, H_{actual} - H_{target})$. By only penalizing entropy when it exceeds a scheduled target (5.2 $\to$ 2.0), the model can focus on classification accuracy while maintaining the necessary exploration budget.
+
+#### 20. Differentiated Weight Decay ($WD = 10^{-3}$)
+Applied a specific weight decay to the score head parameters ($w_u, w_{tri}$). This acts as a restorative force that prevents unbounded weight growth, keeping the logit standard deviation within the optimal 1.5–2.5 range for stable Straight-Through estimation.
+
+#### 21. Selection Stability Bonus (EMA)
+Introduced an optional stability mechanism using an Exponential Moving Average (EMA) of selection frequencies. By rewarding systematically useful patches, this helps "lock in" emerging semantic choices and prevents jittery selection switching in the late training phases.
+

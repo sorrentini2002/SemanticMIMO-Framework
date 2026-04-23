@@ -1,6 +1,0 @@
-- dataset=cifar_100
-- model=deit_tiny_patch16_224
-- communication=noisy
-- dataset.train.download=True
-- dataset.test.download=True
-- ++core.dataset_path=/kaggle/working/data
