@@ -1,3 +1,31 @@
+# Update 30/04 - Analysis with MIMO channel
+
+After obtaining satisfactory results with the AWGN channel, we decided to evaluate the model's performance under more realistic channel conditions, specifically using a MIMO channel.
+The results show that the Gumbel-softmax selection method outperforms random selection also in this case.
+
+![Comparison between random selection and Gumbel-Softmax selection for different SNR regimes](../Plots/baseline/plt14.png)
+
+In addition, we analyzed the effect of the disablement of the mode allocation in the MIMO channel, which resulted no significant impact on the performance of either selection method. The plot below shows the comparison between the two methods with and without mode allocation.
+
+![Comparison between random selection and Gumbel-Softmax selection for different SNR regimes](../Plots/baseline/plt15.png)
+
+In detail, we have run the experiments by insert the split Layer in the first block and we have considered a MIMO channel composed of 4 antennas for each side. For what concerns the Gumbel-Softmax method we have disabled the additional power that we perform into the mode allocation, so we essentialy allocate only the more important tokens in the more important modes.
+
+# Update 26/04 - Change of the splitted layer
+
+Because CIFAR-100 images are only 32×32 and the transformer requires a larger input, we perform an upscaling operation. To avoid excessive resizing, we decided to try a dataset whose default size is closer to the transformer's requirement (224×224). Therefore, we chose the Flowers-102 dataset, whose images naturally fit within a maximum side length of 512.
+
+The last change concerns the model split. Instead of splitting the model after the 3rd transformer block, we split it after the 1st transformer block. The results show that splitting the model after the 1st transformer block provides evidence that the more sophisticated Gumbel method has better performance compared to the simple random selection. In detail, we observe better performance in the scenario with enough tokens sent (around 32/48 tokens) and poor SNR (around -5/0 dB). In this case, the Gumbel method outperforms random selection by about +10% in accuracy. The plots below show the comparison across different split points.
+
+This for split in the 3rd layer:
+
+![Comparison between random selection, Gumbel-Softmax selection with split point in the 3rd layer token selection for different SNR regimes](../Plots/baseline/plt12.png)
+
+This for split in the 1st layer:
+
+![Comparison between random selection, Gumbel-Softmax selection with split point in the 1rd layer token selection for different SNR regimes](../Plots/baseline/plt13.png)
+
+
 # Update 23/04 - Comparison with the selection of top k tokens based on their CLS token attention weights
 
 To contestualize the results, we compared the Gumbel-Softmax selection with a greedy approach: selecting the top k tokens based on their CLS token attention weights.

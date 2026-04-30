@@ -10,26 +10,26 @@ parameters:
   semantic_waterfilling: true
 
   # --- GUMBEL CORE ---
-  tau_start: 2.0
-  tau_end: 0.5          # ← 0.3→0.5: logit scaling gestisce la sharpness finale
+  tau_start: 1.8
+  tau_end: 1.05         
   schedule: cosine
   steps: 10000
   hard: true
   straight_through: true
-  gamma_init: 1.5       # ← 2.0→1.5: ramo triangolare parte più cauto
+  gamma_init: 1.5       
   beta_init: 1.0
-  gate_init: -2.0       # ← -1.0→-2.0: gate più chiuso all'inizio (sigmoid≈0.12)
+  gate_init: -2.0       
 
   # --- LOGIT SCALING DINAMICO ---
-  logit_scale_start: 0.1
-  logit_scale_end:   1.0
+  logit_scale_start: 0.4
+  logit_scale_end:   0.65
   logit_scale_mode:  cosine
 
   # --- ENTROPY BOTTLENECK ---
   entropy_bottleneck_enabled: true
   entropy_target_start:       5.2
-  entropy_target_end:         1.8   # ← 2.0→1.8: obiettivo finale leggermente più nitido
-  entropy_bottleneck_weight:  0.10  # ← 0.05→0.10: segnale abbastanza forte da contare
+  entropy_target_end:         3.5  
+  entropy_bottleneck_weight:  0.15  
 
   # --- STABILITY BONUS ---
   stability_bonus_enabled:   false
@@ -37,19 +37,19 @@ parameters:
   stability_bonus_weight:    0.3
 
   # --- REGULARIZATION ---
-  entropy_reg_enabled: false
-  entropy_reg_weight:  0.01
+  entropy_reg_enabled: true
+  entropy_reg_weight:  0.02
 
-  cov_reg_enabled:    true
-  cov_reg_weight:     0.2           # ← 0.5→0.2: riduce conflitto con entropy bottleneck
+  cov_reg_enabled:    false
+  cov_reg_weight:     0.2           
   cov_reg_margin:     0.3
   cov_reg_max_tokens: 64
 
   # --- VALUTAZIONE ---
-  eval_k: 20                        # ← 32→20: allineato a 10% di 196 patch
+  eval_k: 20                       
   gumbel_mc_enabled:   true
   gumbel_mc_samples:   16
-  gumbel_mc_tau:       0.3          # ← 0.5→0.3: coerente con logit maturi a full scale
+  gumbel_mc_tau:       0.3         
   gumbel_mc_aggregate: "mean"
 
   # --- DIVERSIFY ---

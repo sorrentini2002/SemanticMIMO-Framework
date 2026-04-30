@@ -10,7 +10,7 @@ defaults:
 
 # Hyperparameters 
 hyperparameters:
-  split_index : 3  # Where to split the network
+  split_index : 1  # Where to split the network
   experiment_name : test  # Name of the experiment
   seeds: [42]  # Single seed by default for faster turnaround
 

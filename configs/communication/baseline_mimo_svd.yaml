@@ -13,7 +13,7 @@ channel:
 comm:
   enabled: true
   bottleneck:
-    enabled: true
+    enabled: false
     out_dim: 128
   channel:
     enabled: true
@@ -22,7 +22,7 @@ comm:
     n_rx: 4
     fading: "rayleigh"
     equalizer: "mmse"
-    snr_db: [0, 20]
+    snr_db: [-10, 20]
     train_mode: "sampled"
     sample_mode: "per_sample"
     normalize: true
@@ -44,7 +44,7 @@ comm:
         eps: 1.0e-4
       num_modes: null
     power_alloc:
-      enabled: true
+      enabled: false
       source: "selection_scores"
       alpha: 1.0
       eps: 1.0e-4

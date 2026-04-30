@@ -591,3 +591,18 @@ The `mode_alloc.power` sub-feature is a secondary power adjustment that operates
 
 This is conceptually different from `stream_alloc.power` (which scales antennas based on diagonal gains) — it adjusts mode-level energy based on the aggregate importance of tokens that were mapped to each mode.
 
+---
+
+## 14. Critical Numerical Stability Fixes
+
+### 🔴 SVD Backward Explosion (`comm_module.py:484`)
+`torch.linalg.svd(H)` produces $V$ which participates in the computational graph. The backward pass of SVD contains terms proportional to $1/(\sigma_i^2 - \sigma_j^2)$ and $1/\sigma_k$ which explode when singular values are close or near-zero.
+- **Evidence:** $\sigma_{min} \approx 0.002$ vs $\sigma_{max} \approx 2.4$ (ratio 1200:1).
+- **Fix:** 
+  1. `h.detach()` before SVD to stop gradient flow through the channel realization.
+  2. $\epsilon I$ perturbation to ensure distinct singular values.
+  3. `clamp` on singular values $\sigma$ during allocation logic.
+
+### 🔴 Mode Power Scaling (`comm_module.py:686-689`)
+The term `torch.sqrt(weights)` where `weights → 0` (e.g., pruned modes) has a gradient $\frac{1}{2\sqrt{x}}$ that approaches $\infty$ as $x \to 0$. Additionally, `pre_power / post_power` calculations can explode if the denominator is near-zero.
+- **Fix:** Implement `clamp_min(1e-6)` on `weights` and `power` variables before applying square roots or divisions to ensure stable gradient flow and prevent `NaN` propagation.

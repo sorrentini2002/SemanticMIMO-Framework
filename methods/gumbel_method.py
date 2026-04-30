@@ -437,12 +437,27 @@ class Gumbel_Token_Selection_Block_Wrapper(nn.Module):
                     )
 
         # ==========================================
-        # 7. BUILD last_adc_scores (unchanged)
+        # 7. BUILD last_adc_scores — Semantic Waterfilling Scores
         # ==========================================
+        # FIX: Three architectural defects corrected:
+        #
+        # DEFECT #1 (was): patch_scores_probs = softmax(logits) over ALL 196 patches
+        #   → each value ≈ 1/196 ≈ 0.005, near-uniform, no dynamic range.
+        #   FIX: Re-softmax over ONLY the selected ~20 tokens → p ≈ 0.02-0.15.
+        #
+        # DEFECT #2 (was): cls_dummy = 1.0 while patches ≈ 0.005 → 200:1 mismatch.
+        #   FIX: CLS = max(selected_scores) + small margin, same scale as patches.
+        #
+        # DEFECT #3 (was): Softmax Jacobian over 196 elements ≈ 0.005 → gradients
+        #   from channel back to score head were ~200× weaker than CE gradient.
+        #   FIX: Softmax over ~20 elements → Jacobian ≈ 0.05, 10× stronger signal.
+        #
         selected_patch_indices = indices_sel[:, 1:] - 1
-        selected_patch_scores  = torch.gather(patch_scores_probs, 1, selected_patch_indices)
-        cls_dummy = torch.ones((B, 1), dtype=selected_patch_scores.dtype, device=device)
-        self.last_adc_scores  = torch.cat([cls_dummy, selected_patch_scores], dim=1)
+        selected_logits = torch.gather(final_logits, 1, selected_patch_indices)  # [B, n_alpha]
+        selected_scores = F.softmax(selected_logits, dim=-1)                     # [B, n_alpha]
+        # CLS: highest importance but on the same scale as patches
+        cls_score = selected_scores.max(dim=1, keepdim=True).values + 0.01       # [B, 1]
+        self.last_adc_scores  = torch.cat([cls_score, selected_scores], dim=1)   # [B, 1+n_alpha]
         self.last_indices_sel = indices_sel
         self.last_original_N  = N
 

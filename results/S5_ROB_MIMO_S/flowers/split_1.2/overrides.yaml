@@ -1,0 +1,10 @@
+- method=gumbel
+- communication=baseline_mimo_svd
+- dataset=flowers_102
+- model=deit_tiny_patch16_224
+- optimizer=adam
+- hyperparameters.experiment_name=Mimo_Gumbel_Layer1_Compr_32
+- dataset.train.download=True
+- dataset.test.download=True
+- ++core.dataset_path=/kaggle/working/data
+- method.parameters.desired_compression=0.1582

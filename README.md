@@ -68,9 +68,9 @@ Provides a detailed description of the ongoing experimental test, including mode
 Provides a detailed description of the results of the ongoing experimental test, including a set of plots that summarize the results.
 * 📖 **Read more:** [Current Result Description](Documents/result_description.md)
 
-### Documents/sintesi.md
-Provides a detailed description of the experimental test and its baseline scenarios.
-* 📖 **Read more:** [Sintesi Description](Documents/sintesi.md)
+### Documents/baseline_description.md
+Defines the 11 baseline experimental scenarios (S1 through S5, with hierarchical tags like MIS/ROB and B/S/BS) with detailed specifications of compression, channel, and training configurations. Maps each scenario to its corresponding results folder structure for systematic comparison.
+* 📖 **Read more:** [Baseline Scenario Definitions](Documents/sintesi.md)
 
 ---
 

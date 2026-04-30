@@ -21,7 +21,7 @@ comm:
     n_rx: 4
     fading: "identity"        # rayleigh | identity | diagonal
     equalizer: "mmse"         # mmse | zf
-    snr_db: [0, 20]
+    snr_db: [-10, 20]
     train_mode: "sampled"
     sample_mode: "per_sample"
     normalize: true

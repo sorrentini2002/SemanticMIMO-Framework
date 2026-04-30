@@ -146,13 +146,24 @@ class CommModule(nn.Module):
         pad = tx_signal.new_ones((bsz, n_patches - scores.shape[1]))
         return torch.cat([scores, pad], dim=1)
 
-    def _apply_power_allocation(self, tx_signal, selection_indices=None, selection_scores=None):
+    def _apply_power_allocation(self, tx_signal, selection_indices=None, selection_scores=None, current_snr_db=None):
         cfg = self.power_alloc_cfg or {}
         enabled = bool(cfg.get("enabled", False))
-        alpha = float(cfg.get("alpha", 1.0))
+        alpha_base = float(cfg.get("alpha", 1.0))
         source = str(cfg.get("source", "selection_scores"))
         eps = float(cfg.get("eps", 1e-4))
         apply_to_cls = bool(cfg.get("apply_to_cls", False))
+
+        # ── SNR-ADAPTIVE ALPHA TEMPERING ──────────────────────────
+        snr_threshold = float(cfg.get("snr_threshold", 5.0))
+        snr_slope     = float(cfg.get("snr_slope", 0.3))
+        if current_snr_db is not None:
+            _arg = -snr_slope * (current_snr_db - snr_threshold)
+            _sig = float(torch.tensor([_arg]).sigmoid().item())
+            alpha = alpha_base * _sig
+        else:
+            alpha = alpha_base
+        # ─────────────────────────────────────────────────────────
 
         stats = {
             "power_alloc_enabled": enabled,
@@ -479,12 +490,31 @@ class CommModule(nn.Module):
     # ------------------------------------------------------------------
 
     def _compute_svd_modes(self, h, eps=1e-6):
-        """Compute SVD of H. Returns (V, sigma) or None on failure."""
+        """Compute SVD of H. Returns (V, sigma) or None on failure.
+
+        H is sampled noise with no learnable parameters, so we detach it
+        from the computation graph to avoid the numerically unstable SVD
+        backward (which contains 1/(σ_i² - σ_j²) terms that explode when
+        singular values are close or near-zero).  An εI perturbation is
+        added to prevent exact degeneracy.
+        """
         try:
-            u, sigma, vh = torch.linalg.svd(h, full_matrices=False)
+            # ── FIX: Detach H — V and Σ are constants, not differentiable ──
+            h_detached = h.detach()
+
+            # ── FIX: εI perturbation to prevent degenerate singular values ──
+            eye = torch.eye(h_detached.shape[-1], device=h.device, dtype=h.dtype)
+            h_reg = h_detached + eps * eye.unsqueeze(0)
+
+            u, sigma, vh = torch.linalg.svd(h_reg, full_matrices=False)
+
             if torch.isnan(sigma).any() or torch.isinf(sigma).any():
                 logger.warning("SVD produced NaN/Inf singular values; disabling mode_alloc for this batch.")
                 return None
+
+            # ── FIX: Clamp tiny singular values to prevent 1/σ explosions ──
+            sigma = sigma.clamp_min(eps)
+
             return vh.transpose(-2, -1), sigma  # V [B, n_tx, K], sigma [B, K]
         except RuntimeError as e:
             logger.warning(f"SVD failed ({e}); disabling mode_alloc for this batch.")
@@ -498,6 +528,7 @@ class CommModule(nn.Module):
         tx_signal,
         selection_indices,
         selection_scores,
+        current_snr_db=None,
     ):
         """Apply SVD mode allocation to packed signal.
 
@@ -551,6 +582,25 @@ class CommModule(nn.Module):
         # for zeroing power on weak modes.
         prune_mask = torch.zeros_like(sigma, dtype=torch.bool)
         sigma_for_assignment = sigma
+        
+        # ── SNR-ADAPTIVE PRUNING ───────────────────────────────
+        # At high SNR, we shouldn't prune modes because even weak modes
+        # have enough capacity. We temper the threshold to 0 at high SNR.
+        prune_cfg = cfg.get("prune", {}) or {}
+        prune_enabled = bool(prune_cfg.get("enabled", True))
+        prune_rel_threshold_base = float(prune_cfg.get("sigma_rel_threshold", 0.1))
+        
+        if current_snr_db is not None:
+            power_cfg_tmp = cfg.get("power", {}) or {}
+            _snr_thresh = float(power_cfg_tmp.get("snr_threshold", 5.0))
+            _snr_slope  = float(power_cfg_tmp.get("snr_slope", 0.3))
+            _arg_prune = -_snr_slope * (current_snr_db - _snr_thresh)
+            _sig_prune = float(torch.tensor([_arg_prune]).sigmoid().item())
+            prune_rel_threshold = prune_rel_threshold_base * _sig_prune
+        else:
+            prune_rel_threshold = prune_rel_threshold_base
+        # ─────────────────────────────────────────────────────────
+        
         if prune_enabled and k > 0:
             sigma_max = sigma.max(dim=1, keepdim=True).values.clamp_min(1e-9)
             prune_mask = sigma < (prune_rel_threshold * sigma_max)
@@ -628,8 +678,21 @@ class CommModule(nn.Module):
 
         # Optional power allocation in mode domain
         if power_enabled and t > 0:
-            alpha     = float(power_cfg.get("alpha", 1.0))
-            power_eps = float(power_cfg.get("eps",   1e-4))
+            alpha_base = float(power_cfg.get("alpha", 1.0))
+            power_eps  = float(power_cfg.get("eps",   1e-4))
+
+            # ── SNR-ADAPTIVE ALPHA TEMPERING ──────────────────────────
+            # Waterfilling theory: at high SNR, optimal allocation is UNIFORM.
+            # We temper alpha via sigmoid so it decays toward 0 at high SNR:
+            snr_threshold = float(power_cfg.get("snr_threshold", 5.0))
+            snr_slope     = float(power_cfg.get("snr_slope", 0.3))
+            if current_snr_db is not None:
+                _arg = -snr_slope * (current_snr_db - snr_threshold)
+                _sig = float(torch.tensor([_arg]).sigmoid().item())
+                alpha = alpha_base * _sig
+            else:
+                alpha = alpha_base
+            # ─────────────────────────────────────────────────────────
 
             if tx_signal is not None and mode_alloc_ctx is not None:
                 # Compute per-mode importance directly from positions scatter
@@ -683,10 +746,11 @@ class CommModule(nn.Module):
                 )
 
             weights    = weights / weights.mean(dim=1, keepdim=True).clamp_min(1e-9)
-            pre_power  = s_mode.pow(2).mean(dim=(1, 2), keepdim=True)
-            s_mode     = s_mode * torch.sqrt(weights).unsqueeze(-1)
-            post_power = s_mode.pow(2).mean(dim=(1, 2), keepdim=True)
-            s_mode     = s_mode * torch.sqrt(pre_power / post_power.clamp_min(1e-9))
+            # ── FIX: clamp weights before sqrt to prevent ∞ gradient (1/(2√0)) ──
+            pre_power  = s_mode.pow(2).mean(dim=(1, 2), keepdim=True).clamp_min(1e-9)
+            s_mode     = s_mode * torch.sqrt(weights.clamp_min(1e-6)).unsqueeze(-1)
+            post_power = s_mode.pow(2).mean(dim=(1, 2), keepdim=True).clamp_min(1e-9)
+            s_mode     = s_mode * torch.sqrt(pre_power / post_power)
 
         # --- Project mode domain → antenna domain: s_out = V @ s_mode ---
         s_out = torch.matmul(v_mat[:, :, :k], s_mode)  # [B, n_tx, T]
@@ -700,20 +764,20 @@ class CommModule(nn.Module):
                     tx_signal, selection_indices, selection_scores, source,
                     bool((cfg.get("assignment", {}) or {}).get("prioritize_cls", True)),
                 )
-                _, n_tok, d_sent = tx_signal.shape
-                positions = mode_alloc_ctx["positions"]  # [B, l_assign]
-                src_order = mode_alloc_ctx["src_order"]  # [B, l_assign]
-                l_assign = int(mode_alloc_ctx["l_assign"])
-
-                if l_assign > 0:
-                    token_ids = torch.div(src_order, d_sent, rounding_mode="floor")
-                    # positions index the K×T mode grid → positions//t = mode index
-                    mode_ids = torch.div(positions, t, rounding_mode="floor").clamp(min=0, max=k - 1)
+                _l_assign = mode_alloc_ctx["l_assign"]
+                if _l_assign > 0:
+                    _, _n_tokens, _d_sent = tx_signal.shape
+                    _src_order = mode_alloc_ctx["src_order"]
+                    _positions = mode_alloc_ctx["positions"]
+                    
+                    token_ids = torch.div(_src_order, _d_sent, rounding_mode="floor").clamp(min=0, max=_n_tokens - 1)
+                    # _positions index the K×T mode grid → _positions//t = mode index
+                    mode_ids = torch.div(_positions, t, rounding_mode="floor").clamp(min=0, max=k - 1)
                     mode_gains = torch.gather(sigma, 1, mode_ids)
 
-                    token_gain_sum = packed.new_zeros((bsz, n_tok))
-                    token_gain_cnt = packed.new_zeros((bsz, n_tok))
-                    ones = packed.new_ones((bsz, l_assign))
+                    token_gain_sum = packed.new_zeros((bsz, _n_tokens))
+                    token_gain_cnt = packed.new_zeros((bsz, _n_tokens))
+                    ones = packed.new_ones((bsz, _l_assign))
                     token_gain_sum.scatter_add_(1, token_ids, mode_gains)
                     token_gain_cnt.scatter_add_(1, token_ids, ones)
 
@@ -725,7 +789,7 @@ class CommModule(nn.Module):
                         n_sent_tokens = int((token_gain_cnt[b] > 0).sum().item())
                         if n_sent_tokens <= 0:
                             continue
-                        k_eval = max(1, min(n_sent_tokens, n_tok // 2))
+                        k_eval = max(1, min(n_sent_tokens, _n_tokens // 2))
                         top_imp_tokens = imp[b].topk(k_eval).indices.tolist()
                         top_gain_tokens = token_gain_mean[b].topk(k_eval).indices.tolist()
                         overlap = len(set(top_imp_tokens) & set(top_gain_tokens)) / float(k_eval)
@@ -751,6 +815,55 @@ class CommModule(nn.Module):
             "mode_alloc_power_alpha": float(power_cfg.get("alpha", 1.0)) if power_enabled else 0.0,
             "mode_alloc_top_imp_frac": top_imp_frac,
         }
+
+        # ── MODE-DOMAIN WATERFILLING DIAGNOSTICS ─────────────────────
+        with torch.no_grad():
+            if power_enabled and 'weights' in dir() and weights is not None and k > 1:
+                active_w = weights[weights > 0] if (weights > 0).any() else weights.flatten()
+                
+                # 1. Per-mode importance std
+                if 'per_mode_imp' in dir() and per_mode_imp is not None:
+                    stats["wf_mode_imp_std"] = float(per_mode_imp.std().item())
+                else:
+                    stats["wf_mode_imp_std"] = 0.0
+                
+                # 2. Mode power ratio
+                if active_w.numel() > 1:
+                    stats["wf_mode_power_ratio"] = float(
+                        (active_w.max() / active_w.min().clamp_min(1e-12)).item()
+                    )
+                else:
+                    stats["wf_mode_power_ratio"] = 1.0
+                
+                # 3. Mode power-importance correlation
+                if 'per_mode_imp' in dir() and per_mode_imp is not None and per_mode_imp.shape == weights.shape:
+                    mi = per_mode_imp - per_mode_imp.mean(dim=1, keepdim=True)
+                    mw = weights - weights.mean(dim=1, keepdim=True)
+                    num = (mi * mw).sum(dim=1)
+                    den = (mi.norm(dim=1) * mw.norm(dim=1)).clamp_min(1e-12)
+                    stats["wf_mode_power_imp_corr"] = float((num / den).mean().item())
+                else:
+                    stats["wf_mode_power_imp_corr"] = 0.0
+
+                # 4. Gini Coefficient for power distribution (0=uniform, 1=concentrated)
+                # G = (sum_{i=1}^n (2i - n - 1) * w_i) / (n * sum w_i)
+                w_sorted = torch.sort(weights, dim=1).values
+                n_w = w_sorted.shape[1]
+                idx_gini = torch.arange(1, n_w + 1, device=device, dtype=dtype)
+                gini_num = torch.sum((2 * idx_gini - n_w - 1) * w_sorted, dim=1)
+                gini_den = n_w * torch.sum(w_sorted, dim=1)
+                stats["wf_mode_power_gini"] = float((gini_num / gini_den.clamp_min(1e-9)).mean().item())
+                
+                # 5. Effective Alpha
+                stats["wf_mode_alpha_eff"] = float(alpha)
+            else:
+                stats["wf_mode_imp_std"] = 0.0
+                stats["wf_mode_power_ratio"] = 1.0
+                stats["wf_mode_power_imp_corr"] = 0.0
+                stats["wf_mode_power_gini"] = 0.0
+                stats["wf_mode_alpha_eff"] = 0.0
+        # ─────────────────────────────────────────────────────────────
+
         if num_modes is not None:
             stats["mode_alloc_num_modes"] = int(num_modes)
 
@@ -874,10 +987,14 @@ class CommModule(nn.Module):
             
         # 2. Channel
         if self.use_channel:
+            # Resolve current SNR early for all adaptive logic
+            _curr_snr = self.channel._resolve_snr(tx_signal, generator)
+
             tx_signal, power_stats = self._apply_power_allocation(
                 tx_signal,
                 selection_indices=selection_indices,
                 selection_scores=selection_scores,
+                current_snr_db=_curr_snr,
             )
             info.update(power_stats)
 
@@ -912,6 +1029,7 @@ class CommModule(nn.Module):
                         tx_signal=tx_signal,
                         selection_indices=selection_indices,
                         selection_scores=selection_scores,
+                        current_snr_db=_curr_snr,
                     )
                     if ma_stats.get("mode_alloc_enabled", False):
                         packed = packed_ma
@@ -926,25 +1044,35 @@ class CommModule(nn.Module):
                 elif diagonal_gains is not None:
                     ch_kwargs["diagonal_gains"] = diagonal_gains
 
-                # Propagate per-stream power weights to MMSE equaliser
-                # so it uses the correct covariance (H^T H + σ² W^{-1})^{-1}
-                if alloc_stats.get("stream_alloc_power_enabled", 0.0) > 0:
-                    # Recover the stream power weights from alloc_ctx
-                    # (the weights were applied to packed in _pack_mimo_symbols)
-                    _sp_cfg = (self.stream_alloc_cfg or {}).get("power", {}) or {}
-                    _sp_alpha = float(_sp_cfg.get("alpha", 1.0))
-                    _sp_eps   = float(_sp_cfg.get("eps", 1e-4))
-                    _sp_gain_alpha = float(_sp_cfg.get("gain_alpha", 1.0))
-                    _sp_max_ratio  = float(_sp_cfg.get("max_power_ratio", 10.0))
-                    _sp_source = str((self.stream_alloc_cfg or {}).get(
-                        "source", self.power_alloc_cfg.get("source", "selection_scores")))
-                    _sp_prioritize_cls = bool(((self.stream_alloc_cfg or {}).get(
-                        "assignment", {}) or {}).get("prioritize_cls", True))
-                    _bsz_sp = tx_signal.shape[0]
-                    _n_tokens_sp = tx_signal.shape[1]
-                    _d_sent_sp = tx_signal.shape[2]
-                    _l_sp = _n_tokens_sp * _d_sent_sp
-                    _t_sp = pack_stats["mimo_T"]
+                    # Propagate per-stream power weights to MMSE equaliser
+                    # so it uses the correct covariance (H^T H + σ² W^{-1})^{-1}
+                    if alloc_stats.get("stream_alloc_power_enabled", 0.0) > 0:
+                        # Recover the stream power weights from alloc_ctx
+                        # (the weights were applied to packed in _pack_mimo_symbols)
+                        _sp_cfg = (self.stream_alloc_cfg or {}).get("power", {}) or {}
+                        _sp_alpha_base = float(_sp_cfg.get("alpha", 1.0))
+                        _sp_eps   = float(_sp_cfg.get("eps", 1e-4))
+                        _sp_gain_alpha = float(_sp_cfg.get("gain_alpha", 1.0))
+                        _sp_max_ratio  = float(_sp_cfg.get("max_power_ratio", 10.0))
+                        _sp_source = str((self.stream_alloc_cfg or {}).get(
+                            "source", self.power_alloc_cfg.get("source", "selection_scores")))
+                        _sp_prioritize_cls = bool(((self.stream_alloc_cfg or {}).get(
+                            "assignment", {}) or {}).get("prioritize_cls", True))
+                        
+                        # ── SNR-ADAPTIVE ALPHA TEMPERING (MMSE SIDE) ──────
+                        _sp_snr_threshold = float(_sp_cfg.get("snr_threshold", 5.0))
+                        _sp_snr_slope     = float(_sp_cfg.get("snr_slope", 0.3))
+                        _sp_arg = -_sp_snr_slope * (_curr_snr - _sp_snr_threshold)
+                        _sp_sig = float(torch.tensor([_sp_arg]).sigmoid().item())
+                        _sp_alpha = _sp_alpha_base * _sp_sig
+                        # ──────────────────────────────────────────────────
+
+                        _bsz_sp = tx_signal.shape[0]
+                        _n_tokens_sp = tx_signal.shape[1]
+                        _d_sent_sp = tx_signal.shape[2]
+                        _l_sp = _n_tokens_sp * _d_sent_sp
+                        _t_sp = pack_stats["mimo_T"]
+
 
                     if alloc_ctx is not None and "positions" in alloc_ctx:
                         _tk_scores = self._resolve_stream_alloc_scores(

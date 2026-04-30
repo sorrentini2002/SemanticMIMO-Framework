@@ -266,4 +266,19 @@ Applied a specific weight decay to the score head parameters ($w_u, w_{tri}$). T
 
 #### 21. Selection Stability Bonus (EMA)
 Introduced an optional stability mechanism using an Exponential Moving Average (EMA) of selection frequencies. By rewarding systematically useful patches, this helps "lock in" emerging semantic choices and prevents jittery selection switching in the late training phases.
+
+---
+
+## 22. Semantic Score Interface Issues (Legacy)
+
+The following issues were identified as the primary causes for the failure of semantic waterfilling in earlier versions:
+
+### 🔴 #1 Softmax probabilities passed as scores (`gumbel_method.py:L443`)
+The system was passing normalized softmax probabilities as importance scores. With 196 patches, `patch_scores_probs ≈ 1/196 ≈ 0.005` for all tokens.
+- **Consequence:** The communication channel received nearly uniform values with a dynamic range close to zero. The waterfilling algorithm had no meaningful differentiation to perform resource allocation.
+
+### 🔴 #2 CLS dummy = 1.0 vs patches ≈ 0.005 (`gumbel_method.py:L444`)
+The CLS token was assigned a hardcoded dummy score of `1.0`, while patches had scores around `0.005`.
+- **Consequence:** This created a massive 200:1 scale imbalance. Although partially mitigated by `apply_to_cls=false`, the resulting `last_adc_scores` vector was mathematically incoherent, causing the power allocation logic to focus almost exclusively on the CLS token while starving all other patches.
+
 

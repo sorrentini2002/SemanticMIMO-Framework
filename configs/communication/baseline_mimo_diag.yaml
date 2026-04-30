@@ -42,7 +42,7 @@ comm:
         enabled: true
         alpha: 1.0
         eps: 1.0e-4
-    snr_db: [0, 20]
+    snr_db: [-10, 20]
     train_mode: "sampled"
     normalize: true
     normalization_mode: "sample"

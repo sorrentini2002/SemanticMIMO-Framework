@@ -413,6 +413,8 @@ class MIMOAWGNChannel(nn.Module):
             p_received = torch.mean(
                 y_signal.reshape(bsz, -1) ** 2, dim=1, keepdim=True,
             )  # [B, 1]
+            # ── FIX: Clamp to prevent NaN/Inf from upstream propagating ──
+            p_received = p_received.clamp(min=1e-12, max=1e6)
             sigma2_vec = (p_received.view(-1) / snr_linear).to(dtype=dtype)
 
         # Additive noise
