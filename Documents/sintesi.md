@@ -1,15 +1,24 @@
+# Update 06/05 - Introduce Inverse Semantic Waterfilling
+
+The next step was to introduce the Inverse Semantic Waterfilling technique: the idea behind it is to give extra power to the worst modes rather than the best ones.
+The reason lies in the fact that, assuming that tokens are compressed using the Gumbel Softmax method, it is considered vital to preserve not only the best tokens already traveling on the best modes, but rather to compensate for the reduced quality of the worst modes by associating a greater amount of power. The goal is to be able to correctly transmit all tokens that have passed the Gumbel Softmax compression, not just the best ones.
+
+The results show a significant improvement over the application of classic Semantic Waterfilling, confirming the hypothesis that it is necessary to transmit as many tokens as possible rather than transmitting only the best ones with absolute certainty.
+
+![Comparison between Inverse and Semantic Waterfilling for different SNR regimes](../Plots/baseline/plt16.png)
+
 # Update 30/04 - Analysis with MIMO channel
 
 After obtaining satisfactory results with the AWGN channel, we decided to evaluate the model's performance under more realistic channel conditions, specifically using a MIMO channel.
-The results show that the Gumbel-softmax selection method outperforms random selection also in this case.
+The results show that the clearest improvement compared to the Random case is achieved by applying an ideal mode allocation strategy without applying semantic waterfilling.
 
 ![Comparison between random selection and Gumbel-Softmax selection for different SNR regimes](../Plots/baseline/plt14.png)
 
-In addition, we analyzed the effect of the disablement of the mode allocation in the MIMO channel, which resulted no significant impact on the performance of either selection method. The plot below shows the comparison between the two methods with and without mode allocation.
+We also analyzed the effect of disabling mode assignment in the MIMO channel while still allocating additional power to the most important tokens. It's important to note that this isn't semantic waterfilling, but rather an extra power allocation because we're processing the tokens separately, not considering the modes they're associated with.
 
 ![Comparison between random selection and Gumbel-Softmax selection for different SNR regimes](../Plots/baseline/plt15.png)
 
-In detail, we have run the experiments by insert the split Layer in the first block and we have considered a MIMO channel composed of 4 antennas for each side. For what concerns the Gumbel-Softmax method we have disabled the additional power that we perform into the mode allocation, so we essentialy allocate only the more important tokens in the more important modes.
+In detail, we have run the experiments by insert the split Layer in the first block and we have considered a MIMO channel composed of 4 antennas for each side.
 
 # Update 26/04 - Change of the splitted layer
 

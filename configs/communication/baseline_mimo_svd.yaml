@@ -39,7 +39,7 @@ comm:
         chunk_size: 1
         prioritize_cls: true
       power:
-        enabled: true
+        enabled: false
         alpha: 1.0
         eps: 1.0e-4
       num_modes: null

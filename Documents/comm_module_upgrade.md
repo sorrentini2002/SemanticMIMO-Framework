@@ -232,7 +232,7 @@ if assignment_enabled and l > 0:
     # Target overlap fractions targeting maximum scores effectively cleanly successfully
     overlap = len(set(top_imp_tokens) & set(top_gain_tokens)) / float(k_eval)
     ...
-alloc_stats["stream_alloc_top_imp_frac"] = stream_top_imp_frac
+    alloc_stats["stream_alloc_top_imp_frac"] = stream_top_imp_frac
 ```
 
 **What changed:** Delivers accurate objective percentages representing directly precisely variables routing optimal importance units safely toward peak channels maximizing exact routing quality percentages successfully (scores towards 1.0 indicate perfect executions routing properly smoothly efficiently).
@@ -585,19 +585,12 @@ The result is a two-level semantic protection:
 - The important token has **more energy** (Power Alloc)
 - AND it travels through the **least lossy** channel mode (Mode Alloc)
 
-### Mode power scaling (optional sub-component)
-
-The `mode_alloc.power` sub-feature is a secondary power adjustment that operates *within* Mode Allocation's pipeline, in the mode domain. Per-mode importance is computed by scattering token importance scores into the K×T mode grid using the same positions, then aggregating per mode row.
-
-This is conceptually different from `stream_alloc.power` (which scales antennas based on diagonal gains) — it adjusts mode-level energy based on the aggregate importance of tokens that were mapped to each mode.
-
 ---
 
 ## 14. Critical Numerical Stability Fixes
 
 ### 🔴 SVD Backward Explosion (`comm_module.py:484`)
 `torch.linalg.svd(H)` produces $V$ which participates in the computational graph. The backward pass of SVD contains terms proportional to $1/(\sigma_i^2 - \sigma_j^2)$ and $1/\sigma_k$ which explode when singular values are close or near-zero.
-- **Evidence:** $\sigma_{min} \approx 0.002$ vs $\sigma_{max} \approx 2.4$ (ratio 1200:1).
 - **Fix:** 
   1. `h.detach()` before SVD to stop gradient flow through the channel realization.
   2. $\epsilon I$ perturbation to ensure distinct singular values.
@@ -606,3 +599,27 @@ This is conceptually different from `stream_alloc.power` (which scales antennas 
 ### 🔴 Mode Power Scaling (`comm_module.py:686-689`)
 The term `torch.sqrt(weights)` where `weights → 0` (e.g., pruned modes) has a gradient $\frac{1}{2\sqrt{x}}$ that approaches $\infty$ as $x \to 0$. Additionally, `pre_power / post_power` calculations can explode if the denominator is near-zero.
 - **Fix:** Implement `clamp_min(1e-6)` on `weights` and `power` variables before applying square roots or divisions to ensure stable gradient flow and prevent `NaN` propagation.
+
+---
+
+## 15. Semantic Load Balancing & CLS Protection (New Upgrades)
+
+Questa sezione riassume gli sviluppi recenti focalizzati sull'allocazione inversa e la protezione del token di classe.
+
+### 15a. Inverse Power Allocation (`alpha = -1.0`)
+È stata implementata la possibilità di invertire la distribuzione dell'energia basata sull'importanza dei token.
+- **Concetto**: Con un valore di `alpha` negativo, il sistema assegna maggiore potenza ai token con minore importanza semantica.
+- **Obiettivo**: Testare la capacità del ricevitore di ricostruire dettagli fini posizionati su modi SVD deboli, equalizzando l'SNR ricevuto tra i diversi stream.
+- **Adattività**: Il parametro viene modulato in base all'SNR del canale; ad alti livelli di segnale, l'allocazione tende automaticamente all'uniformità per massimizzare l'efficienza.
+
+### 15b. Power Floor (`max_power_ratio`)
+Per garantire la stabilità del sistema durante l'allocazione inversa, è stato introdotto un "pavimento" di potenza.
+- **Meccanismo**: Definisce il rapporto massimo consentito tra il modo più potente e quello meno potente all'interno di un batch.
+- **Esempio**: Un valore di `5.0` assicura che nessun modo riceva meno del 20% della potenza massima.
+- **Vantaggio**: Previene lo "spegnimento" (starvation) dei canali che trasportano informazioni critiche quando queste vengono penalizzate dalla logica `alpha`.
+
+### 15c. Protezione del Token CLS (`apply_to_cls`)
+È stata introdotta una deroga specifica per il token di classe, garantendo la robustezza della task di classificazione.
+- **Funzionamento**: Il sistema identifica i modi SVD che trasportano il CLS (mappati sui canali migliori dalla strategia `importance_to_modes`) e li esclude dalla penalizzazione di `alpha`.
+- **Comportamento**: Indipendentemente dal valore di `alpha`, i modi contenenti il CLS ricevono sempre la potenza massima disponibile nel batch.
+- **Importanza**: Permette di sperimentare con la ricostruzione dell'immagine (token spaziali) mantenendo l'accuratezza (Top-1) protetta dal rumore.
