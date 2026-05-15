@@ -668,6 +668,7 @@ class CommModule(nn.Module):
                 "l_assign": l_assign,
                 "v_mat": v_mat,   # [B, n_tx, K] — needed for V^T in unpack
                 "k": k,
+                "d_sent": d_sent,
             }
         else:
             # No assignment: project packed to mode domain via V^T
@@ -680,6 +681,8 @@ class CommModule(nn.Module):
         if power_enabled and t > 0:
             alpha_base = float(power_cfg.get("alpha", 1.0))
             power_eps  = float(power_cfg.get("eps",   1e-4))
+            max_power_ratio = float(power_cfg.get("max_power_ratio", 10.0))
+            apply_to_cls = bool(power_cfg.get("apply_to_cls", True))
 
             # ── SNR-ADAPTIVE ALPHA TEMPERING ──────────────────────────
             # Waterfilling theory: at high SNR, optimal allocation is UNIFORM.
@@ -744,6 +747,54 @@ class CommModule(nn.Module):
                     weights / active_mean.clamp_min(1e-9),
                     torch.zeros_like(weights),
                 )
+
+            # ── CLS PROTECTION & POWER FLOOR ──────────────────────────
+            # 1. Identify modes carrying the CLS token (always the first tokens)
+            if not apply_to_cls and mode_alloc_ctx is not None:
+                # _so: [B, l_assign] -> original flat indices
+                # _pos: [B, l_assign] -> flat mode grid indices
+                _so = mode_alloc_ctx["src_order"]
+                _pos = mode_alloc_ctx["positions"]
+                _d_sent = mode_alloc_ctx["d_sent"] # Need to ensure d_sent is in ctx or available
+                
+                # A mode m carries CLS if any of its slots (m*t to (m+1)*t-1) 
+                # are filled by tokens from src_order < d_sent (first token).
+                is_cls_part = (_so < mode_alloc_ctx["d_sent"])
+                cls_mode_indices = (_pos[is_cls_part] // t).unique()
+                
+                # Protect CLS modes: ensure they have at least 1.0 power 
+                # (before final mean normalization) so they aren't suppressed by alpha < 0
+                if cls_mode_indices.numel() > 0:
+                    # In a vectorized way for the batch
+                    # We can use a mask for modes carrying CLS
+                    cls_mask = torch.zeros_like(weights, dtype=torch.bool)
+                    # Note: cls_mode_indices as computed above is flat across batch if not careful.
+                    # Let's do it per sample for safety.
+                    for b in range(bsz):
+                        b_cls_parts = (_so[b] < mode_alloc_ctx["d_sent"])
+                        if b_cls_parts.any():
+                            b_cls_modes = (_pos[b, b_cls_parts] // t).unique()
+                            cls_mask[b, b_cls_modes] = True
+                    
+                # Per-sample max weight, broadcast to [B, k]
+                max_w_expanded = weights.max(dim=1, keepdim=True).values.expand_as(weights)
+                if alpha < 0:
+                    # Alpha < 0 → important modes got SMALL weights → boost CLS to max
+                    weights = torch.where(cls_mask, torch.maximum(weights, max_w_expanded), weights)
+                else:
+                    # Alpha > 0 → important modes already have high weights → ensure floor of 1.0
+                    floor_one = torch.ones_like(weights)
+                    weights = torch.where(cls_mask, torch.maximum(weights, floor_one), weights)
+
+            # 2. Enforce Max Power Ratio (Power Floor)
+            if max_power_ratio > 1.0:
+                max_w = weights.max(dim=1, keepdim=True).values
+                floor = max_w / max_power_ratio
+                # Apply floor only to active modes
+                weights = torch.maximum(weights, floor)
+                if prune_enabled:
+                    weights = weights.masked_fill(prune_mask, 0.0)
+            # ──────────────────────────────────────────────────────────
 
             weights    = weights / weights.mean(dim=1, keepdim=True).clamp_min(1e-9)
             # ── FIX: clamp weights before sqrt to prevent ∞ gradient (1/(2√0)) ──

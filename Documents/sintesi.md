@@ -1,3 +1,18 @@
+# Update 15/05 Extending the comparison to the third layer
+
+To test the impact of the CLS token on the model's performance and to try to get as close as possible to the model's performance benchmark without compression, we moved the model's split point to after the third layer. This meant working on patches that were no longer raw but much richer semantically.
+The results suggest that simply transmitting the CLS token is not enough to achieve good performance; it must be routed optimally and given adequate power to ensure correct transfer.
+The performance of Inverse Semantic Waterfilling still proved superior to the previously compared models, particularly with low SNR and adequate tokens sent. Furthermore, similar and even better performance was observed compared to the uncompressed case, especially under low SNR conditions.
+
+![Comparison between random selection, Gumbel-Softmax selection and the new method for different SNR regimes](../Plots/baseline/plt18.png)
+
+# Update 11/05 - Comparison with reference baseline
+
+The newly developed method was compared with two configurations that represent the benchmark to be overcome: completely random token compression and compression using the Gumbel method but not leveraging the developed Inverse Semantic Waterfilling system. This was simulated by assuming a model split point immediately after the first layer so as not to overemphasize the CLS Token.
+The results show a clear dominance of the more advanced method, especially in scenarios with poor SNR and few tokens sent.
+
+![Comparison between random selection, Gumbel-Softmax selection and the new method for different SNR regimes](../Plots/baseline/plt17.png)
+
 # Update 06/05 - Introduce Inverse Semantic Waterfilling
 
 The next step was to introduce the Inverse Semantic Waterfilling technique: the idea behind it is to give extra power to the worst modes rather than the best ones.

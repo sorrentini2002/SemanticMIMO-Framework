@@ -39,8 +39,10 @@ comm:
         chunk_size: 1
         prioritize_cls: true
       power:
-        enabled: false
-        alpha: 1.0
+        enabled: true
+        alpha: -1.0
+        max_power_ratio: 5.0
+        apply_to_cls: false
         eps: 1.0e-4
       num_modes: null
     power_alloc:
