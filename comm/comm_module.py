@@ -6,6 +6,7 @@ import torch.nn as nn
 import copy
 from .bottleneck import Bottleneck
 from .mimo import MIMOAWGNChannel, pack_tokens_to_mimo_symbols, unpack_mimo_symbols_to_tokens
+from .dct import apply_dct_spatial, apply_idct_spatial
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +64,8 @@ class CommModule(nn.Module):
         self.power_alloc_cfg = ch_cfg.get("power_alloc", {})
         self.stream_alloc_cfg = ch_cfg.get("stream_alloc", {})
         self.mode_alloc_cfg = ch_cfg.get("mode_alloc", {})
+        # NEW: transmission mode selector — "isw" (default) or "dct_spatial"
+        self.transmission_mode = str(ch_cfg.get("transmission_mode", "isw")).lower()
         
         # Components
         if self.use_bottleneck:
@@ -86,6 +89,8 @@ class CommModule(nn.Module):
         self.power_alloc_cfg = ch_cfg.get("power_alloc", {})
         self.stream_alloc_cfg = ch_cfg.get("stream_alloc", {})
         self.mode_alloc_cfg = ch_cfg.get("mode_alloc", {})
+        # NEW: transmission mode selector — "isw" (default) or "dct_spatial"
+        self.transmission_mode = str(ch_cfg.get("transmission_mode", "isw")).lower()
         
         if ch_type == "mimo":
             sample_mode = str(ch_cfg.get("sample_mode", "")).lower()
@@ -979,6 +984,462 @@ class CommModule(nn.Module):
         restored = rx_ordered.gather(1, restore_order)
         return restored.reshape(bsz, alloc_ctx["tokens_sent"], alloc_ctx["d_sent"])
 
+    # ------------------------------------------------------------------
+    # DCT Spatial Diversity TX/RX Pipeline
+    # ------------------------------------------------------------------
+
+    def _forward_dct_spatial(self, tx_signal, *, generator=None):
+        """
+        Solution A+: CLS-Bypass with Dynamic Payload Pooling.
+
+        THEORETICAL GOAL:
+          Maximize channel capacity utilization by dynamically pooling Mode 0 
+          (strongest SVD virtual mode) back into the patch transmission pool 
+          after the CLS token completes.
+          
+          The transmission is divided into two phases:
+          - Phase 1 (t ∈ [1, T_1]): CLS occupies Mode 0 exclusively, patches use 
+            modes 1 to k_b-1.
+          - Phase 2 (t ∈ [T_1+1, T_b]): CLS complete; Mode 0 is pooled back, 
+            remaining patches exploit all k_b modes for expanded multiplexing.
+          
+          This avoids dead time on the strongest channel and ensures optimal 
+          spatial diversity allocation throughout the transmission window.
+
+        Algorithm (Per-Sample):
+          TX PATH:
+            1. Extract CLS token [D] and patch tokens [N-1, D]
+            2. Phase 1 Timing:
+               - T_1 = D (CLS occupies exactly 1 row for D slots)
+               - Phase 1 patch capacity = (k_b-1) × D elements
+               - Elements packed in Phase 1 = min(L_patches, (k_b-1) × D)
+            3. Phase 2 Timing:
+               - Remaining patches = max(0, L_patches - Phase 1 capacity)
+               - T_2 = ceil(Remaining / k_b)  [now using ALL k_b modes]
+               - T_b = T_1 + T_2
+            4. TX Encoding:
+               Phase 1: CLS → Mode 0 (+boost √β); first chunk of patches 
+                        → Modes 1:k_b-1, apply DCT_(k_b-1)
+               Phase 2: Remaining patches → All k_b modes, apply DCT_k_b
+            5. Project to antenna domain via V_b[:, :k_b]
+            
+          RX PATH (Symmetric):
+            1. Project back to mode domain via V_b^T[:k_b, :]
+            2. Phase 2 Decoding:
+               - Extract s_mode_rx[:, T_1:T_b], undo RMS, apply IDCT_k_b
+               - Collect Phase 2 patch symbols
+            3. Phase 1 Decoding:
+               - Extract s_mode_rx[0, :T_1], divide by √β, unpack CLS
+               - Extract s_mode_rx[1:, :T_1], undo RMS, apply IDCT_(k_b-1)
+               - Collect Phase 1 patch symbols
+            4. Assemble: All patches + CLS → [N, D]
+
+        Args:
+            tx_signal: [B, N, D] token tensor (post-compression, pre-channel).
+            generator:  optional torch.Generator for channel sampling.
+
+        Returns:
+            rx_signal: [B, N, D] reconstructed tokens.
+            ch_stats:  dict from self.channel (SNR, noise_power, …).
+            dct_stats: dict with DCT-specific diagnostics and CLS config.
+        """
+        bsz, n_tokens, d_sent = tx_signal.shape
+        n_tx = self.channel.n_tx
+        n_rx = self.channel.n_rx
+        device = tx_signal.device
+        dtype = tx_signal.dtype
+        compute_dtype = self.channel._compute_dtype(dtype)
+
+        # Parse CLS-Bypass configuration
+        dct_cfg = (self.channel_cfg or {}).get("dct_spatial", {}) or {}
+        cls_power_boost = float(dct_cfg.get("cls_power_boost", 2.0))
+        prune_enabled = bool(dct_cfg.get("prune_enabled", True))
+        prune_snr_threshold_db = float(dct_cfg.get("prune_snr_threshold_db", -20.0))
+        prune_rel_threshold = 10.0 ** (prune_snr_threshold_db / 20.0)
+
+        svd_cfg = (self.mode_alloc_cfg or {}).get("svd", {}) or {}
+        eps = float(svd_cfg.get("eps", 1e-6))
+
+        # ------------------------------------------------------------------
+        # Step 1 — Pre-sample H and compute SVD
+        # ------------------------------------------------------------------
+        h_pre = self.channel._sample_h(bsz, device, generator, compute_dtype)
+        svd_result = self._compute_svd_modes(h_pre, eps=eps)
+
+        if svd_result is None:
+            logger.warning(
+                "_forward_dct_spatial (CLS-Bypass + Dynamic Pooling): SVD failed, falling back to blind MIMO pack."
+            )
+            packed_fb, pack_stats_fb = pack_tokens_to_mimo_symbols(tx_signal, n_tx=n_tx)
+            rx_packed_fb, ch_stats_fb = self.channel(
+                packed_fb, generator=generator, h_override=h_pre
+            )
+            rx_signal_fb = unpack_mimo_symbols_to_tokens(
+                rx_packed_fb,
+                tokens_sent=n_tokens,
+                d_sent=d_sent,
+                original_l=pack_stats_fb["mimo_L"],
+            )
+            dct_stats_fb = {
+                "dct_spatial_active": False,
+                "dct_k_active": 0,
+                "dct_pruned_frac": 0.0,
+                "transmission_mode": "dct_spatial_cls_bypass_dynamic_fallback",
+                "cls_power_boost": cls_power_boost,
+                "dynamic_pooling_enabled": False,
+            }
+            dct_stats_fb.update(pack_stats_fb)
+            dct_stats_fb["mimo_n_rx"] = int(n_rx)
+            return rx_signal_fb, ch_stats_fb, dct_stats_fb
+
+        v_mat, sigma = svd_result
+        k = sigma.shape[1]
+
+        # ------------------------------------------------------------------
+        # Step 2 — Prune weak modes and compute PER-SAMPLE k_b
+        # ------------------------------------------------------------------
+        if prune_enabled and k > 0:
+            sigma_max = sigma.max(dim=1, keepdim=True).values.clamp_min(1e-9)
+            prune_mask = sigma < (prune_rel_threshold * sigma_max)
+            all_pruned = prune_mask.all(dim=1)
+            if all_pruned.any():
+                best_mode = sigma.argmax(dim=1)
+                prune_mask[all_pruned, best_mode[all_pruned]] = False
+        else:
+            prune_mask = torch.zeros(bsz, k, dtype=torch.bool, device=device)
+
+        active_counts = (~prune_mask).sum(dim=1)
+        k_b_vec = active_counts.long()
+        pruned_frac = float(prune_mask.float().mean().item())
+
+        # ------------------------------------------------------------------
+        # Step 3 — DYNAMIC POOLING: Two-Phase Time Partition
+        # Phase 1 (t ∈ [1, T_1]): CLS in Mode 0, patches in modes 1:k_b-1
+        # Phase 2 (t ∈ [T_1+1, T_b]): Remaining patches in ALL k_b modes
+        # ------------------------------------------------------------------
+        n_patch_tokens = max(0, n_tokens - 1)
+        L_patches = n_patch_tokens * d_sent
+
+        # Phase 1 timing: T_1 = D (CLS duration)
+        T_1 = d_sent
+
+        # Per-sample phase calculations
+        T_1_vec = torch.full((bsz,), T_1, device=device, dtype=torch.long)
+        T_2_vec = torch.zeros(bsz, dtype=torch.long, device=device)
+        phase1_patch_capacity_vec = torch.zeros(bsz, dtype=torch.long, device=device)
+        
+        for b in range(bsz):
+            k_b = int(k_b_vec[b].item())
+            if k_b > 1:
+                # Phase 1: patches use k_b-1 modes for T_1 slots
+                phase1_capacity = (k_b - 1) * T_1
+                phase1_patch_capacity_vec[b] = phase1_capacity
+                
+                # Remaining patches for Phase 2
+                remaining_patches = max(0, L_patches - phase1_capacity)
+                
+                if remaining_patches > 0:
+                    # Phase 2: patches use all k_b modes
+                    T_2_b = int(torch.ceil(
+                        torch.tensor(remaining_patches, dtype=torch.float32) / k_b
+                    ).item())
+                    T_2_vec[b] = T_2_b
+                else:
+                    T_2_vec[b] = 0
+            else:
+                # k_b = 1: no phases, all at once
+                phase1_patch_capacity_vec[b] = L_patches
+                T_2_vec[b] = 0
+
+        T_b_vec = T_1_vec + T_2_vec
+        T_max = int(T_b_vec.max().item())
+        T_max = max(1, T_max)
+
+        # For diagnostics
+        mimo_L_global = n_tokens * d_sent
+        mimo_T_global = T_max
+        mimo_L_pad_global = n_tx * T_max
+
+        # ------------------------------------------------------------------
+        # Step 4 — Create global antenna-domain padding tensor [B, n_tx, T_max]
+        # ------------------------------------------------------------------
+        s_ant_padded = tx_signal.new_zeros((bsz, n_tx, T_max))
+        
+        # Storage for RX reversal (per-phase RMS factors)
+        rms_phase1_per_sample = []
+        rms_phase2_per_sample = []
+        boost_factors_per_sample = []
+        phase1_capacity_list = []
+        k_active_list = []
+
+        # ------------------------------------------------------------------
+        # Step 5 — TX LOOP: Per-sample two-phase dynamic pooling encoding
+        # ------------------------------------------------------------------
+        for b in range(bsz):
+            k_b = int(k_b_vec[b].item())
+            T_b = int(T_b_vec[b].item())
+            T_1_b = int(T_1_vec[b].item())
+            T_2_b = int(T_2_vec[b].item())
+            phase1_cap = int(phase1_patch_capacity_vec[b].item())
+            k_active_list.append(k_b)
+            phase1_capacity_list.append(phase1_cap)
+
+            tx_b = tx_signal[b]  # [N, D]
+            v_mat_b = v_mat[b, :, :k_b]  # [n_tx, k_b]
+
+            # Initialize mode grid [k_b, T_b]
+            s_mode_b = tx_signal.new_zeros((k_b, T_b))
+
+            if k_b > 1:
+                # ═══════════════════════════════════════════════════════════
+                # Case: k_b > 1 — Two-phase dynamic pooling
+                # ═══════════════════════════════════════════════════════════
+
+                # --- Phase 1: CLS in Mode 0 + early patches in modes 1:k_b-1 ---
+                cls_token = tx_b[0, :]  # [D]
+                boost_factor = torch.sqrt(torch.tensor(cls_power_boost, 
+                                                       dtype=dtype, device=device))
+                s_mode_b[0, :T_1_b] = cls_token * boost_factor
+                boost_factors_per_sample.append(boost_factor)
+
+                # Phase 1 patches: first phase1_cap elements
+                if n_patch_tokens > 0 and phase1_cap > 0:
+                    patch_tokens = tx_b[1:, :]  # [N-1, D]
+                    patch_flat = patch_tokens.reshape(-1)  # [L_patches]
+                    
+                    # Extract first phase1_cap elements
+                    phase1_patch_flat = patch_flat[:phase1_cap]
+                    
+                    # Reshape into [k_b-1, T_1_b] grid
+                    s_phase1_packed = phase1_patch_flat.reshape(k_b - 1, T_1_b)
+                    
+                    # Apply DCT-II (k_b-1 × k_b-1) along spatial dimension
+                    s_phase1_dct = apply_dct_spatial(
+                        s_phase1_packed.unsqueeze(0), k_b - 1
+                    ).squeeze(0)  # [k_b-1, T_1_b]
+                    
+                    # RMS normalization (equal power)
+                    rms_phase1 = s_phase1_dct.pow(2).mean().clamp_min(1e-9).sqrt()
+                    s_phase1_norm = s_phase1_dct / rms_phase1
+                    rms_phase1_per_sample.append(rms_phase1)
+                    
+                    # Insert into modes 1 to k_b-1, time 0 to T_1_b
+                    s_mode_b[1:k_b, :T_1_b] = s_phase1_norm
+                else:
+                    rms_phase1_per_sample.append(tx_signal.new_ones(()))
+
+                # --- Phase 2: Remaining patches use ALL k_b modes ---
+                remaining_patches = max(0, L_patches - phase1_cap)
+                
+                if n_patch_tokens > 0 and remaining_patches > 0 and T_2_b > 0:
+                    patch_tokens = tx_b[1:, :]
+                    patch_flat = patch_tokens.reshape(-1)
+                    
+                    # Extract remaining patch elements
+                    phase2_patch_flat = patch_flat[phase1_cap:]  # [remaining_patches]
+                    
+                    # Pad to fit exactly k_b × T_2_b grid
+                    phase2_pad_size = k_b * T_2_b
+                    if phase2_patch_flat.shape[0] < phase2_pad_size:
+                        phase2_patch_flat = torch.cat([
+                            phase2_patch_flat,
+                            tx_signal.new_zeros((phase2_pad_size - phase2_patch_flat.shape[0],))
+                        ], dim=0)
+                    
+                    # Reshape into [k_b, T_2_b] grid
+                    s_phase2_packed = phase2_patch_flat[:phase2_pad_size].reshape(k_b, T_2_b)
+                    
+                    # Apply DCT-II (k_b × k_b) along spatial dimension
+                    s_phase2_dct = apply_dct_spatial(
+                        s_phase2_packed.unsqueeze(0), k_b
+                    ).squeeze(0)  # [k_b, T_2_b]
+                    
+                    # RMS normalization (equal power)
+                    rms_phase2 = s_phase2_dct.pow(2).mean().clamp_min(1e-9).sqrt()
+                    s_phase2_norm = s_phase2_dct / rms_phase2
+                    rms_phase2_per_sample.append(rms_phase2)
+                    
+                    # Insert into all k_b modes, time T_1_b to T_b
+                    s_mode_b[:, T_1_b:T_b] = s_phase2_norm
+                else:
+                    rms_phase2_per_sample.append(tx_signal.new_ones(()))
+
+            else:
+                # ═══════════════════════════════════════════════════════════
+                # Edge Case: k_b = 1 — No phases, no boost, no DCT
+                # ═══════════════════════════════════════════════════════════
+                T_total = T_b
+                packed_all, _ = pack_tokens_to_mimo_symbols(tx_b.unsqueeze(0), n_tx=1)
+                packed_all = packed_all.squeeze(0)
+                s_mode_b[0, :T_total] = packed_all.squeeze(0)
+                
+                boost_factors_per_sample.append(tx_signal.new_ones(()))
+                rms_phase1_per_sample.append(tx_signal.new_ones(()))
+                rms_phase2_per_sample.append(tx_signal.new_ones(()))
+
+            # Project to antenna domain: s_ant_b = V_b @ s_mode_b
+            s_ant_b = torch.matmul(
+                v_mat_b.to(dtype=dtype),
+                s_mode_b.unsqueeze(0),
+            ).squeeze(0)  # [n_tx, T_b]
+
+            # Place into global padded tensor
+            s_ant_padded[b, :, :T_b] = s_ant_b
+
+        # Stack per-sample factors for RX
+        boost_stacked = torch.stack(boost_factors_per_sample, dim=0)
+        rms_phase1_stacked = torch.stack(rms_phase1_per_sample, dim=0)
+        rms_phase2_stacked = torch.stack(rms_phase2_per_sample, dim=0)
+
+        # ------------------------------------------------------------------
+        # Step 6 — MIMO channel + MMSE equalization
+        # ------------------------------------------------------------------
+        rx_ant_padded, ch_stats = self.channel(
+            s_ant_padded, generator=generator, h_override=h_pre
+        )
+
+        # ------------------------------------------------------------------
+        # Step 7 & 8 — RX LOOP: Symmetric two-phase dynamic pooling decoding
+        # ------------------------------------------------------------------
+        rx_signals_list = []
+
+        for b in range(bsz):
+            k_b = int(k_b_vec[b].item())
+            T_b = int(T_b_vec[b].item())
+            T_1_b = int(T_1_vec[b].item())
+            T_2_b = int(T_2_vec[b].item())
+            phase1_cap = int(phase1_patch_capacity_vec[b].item())
+            boost_b = boost_stacked[b]
+            rms_phase1_b = rms_phase1_stacked[b]
+            rms_phase2_b = rms_phase2_stacked[b]
+
+            # Extract equalized antenna signal [n_tx, T_b]
+            rx_ant_b = rx_ant_padded[b, :, :T_b]
+
+            # Project back to mode domain: V_b^T @ rx_ant_b
+            v_mat_b_t = v_mat[b, :, :k_b].to(dtype=dtype).transpose(0, 1)
+            s_mode_rx_b = torch.matmul(v_mat_b_t, rx_ant_b)  # [k_b, T_b]
+
+            if k_b > 1:
+                # ═══════════════════════════════════════════════════════════
+                # RX Case: k_b > 1 — Two-phase decoding with dynamic pooling
+                # ═══════════════════════════════════════════════════════════
+
+                patches_collected = []
+
+                # --- Phase 2 Decoding: All k_b modes, remaining patches ---
+                if T_2_b > 0:
+                    s_phase2_rx_dct = s_mode_rx_b[:, T_1_b:T_b]  # [k_b, T_2_b]
+                    
+                    # Undo RMS normalization
+                    s_phase2_rx_dct = s_phase2_rx_dct * rms_phase2_b
+                    
+                    # Apply IDCT-II (k_b × k_b)
+                    s_phase2_rx = apply_idct_spatial(
+                        s_phase2_rx_dct.unsqueeze(0), k_b
+                    ).squeeze(0)  # [k_b, T_2_b]
+                    
+                    # Flatten and extract remaining patches
+                    phase2_flat = s_phase2_rx.reshape(-1)
+                    remaining_patches = max(0, L_patches - phase1_cap)
+                    if remaining_patches > 0:
+                        phase2_patch_flat = phase2_flat[:remaining_patches]
+                        patches_collected.append(phase2_patch_flat)
+
+                # --- Phase 1 Decoding: CLS in Mode 0, patches in modes 1:k_b-1 ---
+                
+                # Recover CLS from Mode 0
+                cls_rx_boosted = s_mode_rx_b[0, :T_1_b]  # [T_1_b = D]
+                cls_rx = cls_rx_boosted / boost_b
+                
+                # Recover Phase 1 patches from modes 1:k_b-1
+                if T_1_b > 0:
+                    s_phase1_rx_dct = s_mode_rx_b[1:k_b, :T_1_b]  # [k_b-1, T_1_b]
+                    
+                    # Undo RMS normalization
+                    s_phase1_rx_dct = s_phase1_rx_dct * rms_phase1_b
+                    
+                    # Apply IDCT-II (k_b-1 × k_b-1)
+                    s_phase1_rx = apply_idct_spatial(
+                        s_phase1_rx_dct.unsqueeze(0), k_b - 1
+                    ).squeeze(0)  # [k_b-1, T_1_b]
+                    
+                    # Flatten and extract phase1 patches
+                    phase1_flat = s_phase1_rx.reshape(-1)
+                    if phase1_cap > 0:
+                        phase1_patch_flat = phase1_flat[:phase1_cap]
+                        patches_collected.insert(0, phase1_patch_flat)
+
+                # Combine all patches
+                if patches_collected:
+                    all_patches_flat = torch.cat(patches_collected, dim=0)
+                    # Reshape to [N-1, D]
+                    patches_rx = unpack_mimo_symbols_to_tokens(
+                        all_patches_flat.unsqueeze(0).unsqueeze(0),
+                        tokens_sent=n_patch_tokens,
+                        d_sent=d_sent,
+                        original_l=L_patches,
+                    ).squeeze(0)  # [N-1, D]
+                else:
+                    patches_rx = tx_signal.new_zeros((n_patch_tokens, d_sent))
+
+                # Assemble: CLS (index 0) + patches (indices 1:N)
+                rx_signal_b = torch.cat([
+                    cls_rx.unsqueeze(0),  # [1, D]
+                    patches_rx,           # [N-1, D]
+                ], dim=0)  # [N, D]
+
+            else:
+                # ═══════════════════════════════════════════════════════════
+                # RX Case: k_b = 1 — Unpack all tokens directly
+                # ═══════════════════════════════════════════════════════════
+                s_mode_rx_all = s_mode_rx_b[0, :T_b]
+                rx_signal_b = unpack_mimo_symbols_to_tokens(
+                    s_mode_rx_all.unsqueeze(0).unsqueeze(0),
+                    tokens_sent=n_tokens,
+                    d_sent=d_sent,
+                    original_l=mimo_L_global,
+                ).squeeze(0)  # [N, D]
+
+            rx_signals_list.append(rx_signal_b)
+
+        rx_signal = torch.stack(rx_signals_list, dim=0)  # [B, N, D]
+
+        # ------------------------------------------------------------------
+        # Diagnostics and statistics
+        # ------------------------------------------------------------------
+        dct_stats = {
+            "transmission_mode": "dct_spatial_cls_bypass_dynamic_pooling",
+            "dct_spatial_active": True,
+            "dynamic_pooling_enabled": True,
+            "cls_power_boost": cls_power_boost,
+            "cls_bypass_enabled": True,
+            "dct_k_active_list": k_active_list,
+            "dct_k_active_min": min(k_active_list) if k_active_list else 0,
+            "dct_k_active_max": max(k_active_list) if k_active_list else 0,
+            "dct_k_active_mean": float(sum(k_active_list) / len(k_active_list)) 
+                                 if k_active_list else 0.0,
+            "dct_k_total": k,
+            "dct_pruned_frac": pruned_frac,
+            "dct_prune_rel_threshold": prune_rel_threshold,
+            "phase1_duration_T1": T_1,
+            "phase1_patch_capacity_list": phase1_capacity_list,
+            "dct_T_phase1": T_1,
+            "dct_T_phase2_max": int(T_2_vec.max().item()) if T_2_vec.numel() > 0 else 0,
+            "dct_T_max": T_max,
+            "mimo_L": mimo_L_global,
+            "mimo_T": mimo_T_global,
+            "mimo_L_pad": mimo_L_pad_global,
+            "sigma_min": float(sigma.min().item()),
+            "sigma_mean": float(sigma.mean().item()),
+            "sigma_max": float(sigma.max().item()),
+            "mimo_n_rx": int(n_rx),
+        }
+
+        return rx_signal, ch_stats, dct_stats
+
+    # ------------------------------------------------------------------
+
     def reconfigure(self, config_snippet):
         """
         Reconfigures the communication module (specifically the channel) in-place.
@@ -1041,145 +1502,158 @@ class CommModule(nn.Module):
             # Resolve current SNR early for all adaptive logic
             _curr_snr = self.channel._resolve_snr(tx_signal, generator)
 
-            tx_signal, power_stats = self._apply_power_allocation(
-                tx_signal,
-                selection_indices=selection_indices,
-                selection_scores=selection_scores,
-                current_snr_db=_curr_snr,
-            )
-            info.update(power_stats)
-
-            if self.channel_type == "mimo":
-                packed, pack_stats, alloc_ctx, alloc_stats, diagonal_gains = self._pack_mimo_symbols(
+            # ── DCT Spatial Diversity path ─────────────────────────────────
+            # When transmission_mode == "dct_spatial" and channel is MIMO,
+            # bypass the entire ISW pipeline (power_alloc, pack, stream_alloc,
+            # mode_alloc) and delegate to the dedicated DCT forward method.
+            if self.channel_type == "mimo" and self.transmission_mode == "dct_spatial":
+                rx_signal, ch_stats, dct_stats = self._forward_dct_spatial(
+                    tx_signal,
+                    generator=generator,
+                )
+                info.update(ch_stats)
+                info.update(dct_stats)
+            else:
+                # ── ISW path (unchanged) ───────────────────────────────────
+                tx_signal, power_stats = self._apply_power_allocation(
                     tx_signal,
                     selection_indices=selection_indices,
                     selection_scores=selection_scores,
-                    generator=generator,
+                    current_snr_db=_curr_snr,
                 )
+                info.update(power_stats)
 
-                # SVD mode allocation for non-diagonal MIMO
-                mode_alloc_cfg = self.mode_alloc_cfg or {}
-                mode_alloc_enabled = (
-                    bool(mode_alloc_cfg.get("enabled", False))
-                    and getattr(self.channel, "fading", None) != "diagonal"
-                )
-                mode_alloc_ctx = None
-                h_override = None
-
-                if mode_alloc_enabled:
-                    # Pre-sample H so SVD and channel use the same realization
-                    bsz_ch = packed.shape[0]
-                    device_ch = packed.device
-                    compute_dtype = self.channel._compute_dtype(packed.dtype)
-                    h_pre = self.channel._sample_h(
-                        bsz_ch, device_ch, generator, compute_dtype,
-                    )
-                    packed_ma, ma_stats, mode_alloc_ctx = self._apply_mode_alloc(
-                        packed,
-                        h_pre,
-                        tx_signal=tx_signal,
+                if self.channel_type == "mimo":
+                    packed, pack_stats, alloc_ctx, alloc_stats, diagonal_gains = self._pack_mimo_symbols(
+                        tx_signal,
                         selection_indices=selection_indices,
                         selection_scores=selection_scores,
-                        current_snr_db=_curr_snr,
+                        generator=generator,
                     )
-                    if ma_stats.get("mode_alloc_enabled", False):
-                        packed = packed_ma
-                        h_override = h_pre
-                    info.update(ma_stats)
-                else:
-                    info["mode_alloc_enabled"] = False
 
-                ch_kwargs = {"selection_indices": selection_indices, "generator": generator}
-                if h_override is not None:
-                    ch_kwargs["h_override"] = h_override
-                elif diagonal_gains is not None:
-                    ch_kwargs["diagonal_gains"] = diagonal_gains
+                    # SVD mode allocation for non-diagonal MIMO
+                    mode_alloc_cfg = self.mode_alloc_cfg or {}
+                    mode_alloc_enabled = (
+                        bool(mode_alloc_cfg.get("enabled", False))
+                        and getattr(self.channel, "fading", None) != "diagonal"
+                    )
+                    mode_alloc_ctx = None
+                    h_override = None
 
-                    # Propagate per-stream power weights to MMSE equaliser
-                    # so it uses the correct covariance (H^T H + σ² W^{-1})^{-1}
-                    if alloc_stats.get("stream_alloc_power_enabled", 0.0) > 0:
-                        # Recover the stream power weights from alloc_ctx
-                        # (the weights were applied to packed in _pack_mimo_symbols)
-                        _sp_cfg = (self.stream_alloc_cfg or {}).get("power", {}) or {}
-                        _sp_alpha_base = float(_sp_cfg.get("alpha", 1.0))
-                        _sp_eps   = float(_sp_cfg.get("eps", 1e-4))
-                        _sp_gain_alpha = float(_sp_cfg.get("gain_alpha", 1.0))
-                        _sp_max_ratio  = float(_sp_cfg.get("max_power_ratio", 10.0))
-                        _sp_source = str((self.stream_alloc_cfg or {}).get(
-                            "source", self.power_alloc_cfg.get("source", "selection_scores")))
-                        _sp_prioritize_cls = bool(((self.stream_alloc_cfg or {}).get(
-                            "assignment", {}) or {}).get("prioritize_cls", True))
-                        
-                        # ── SNR-ADAPTIVE ALPHA TEMPERING (MMSE SIDE) ──────
-                        _sp_snr_threshold = float(_sp_cfg.get("snr_threshold", 5.0))
-                        _sp_snr_slope     = float(_sp_cfg.get("snr_slope", 0.3))
-                        _sp_arg = -_sp_snr_slope * (_curr_snr - _sp_snr_threshold)
-                        _sp_sig = float(torch.tensor([_sp_arg]).sigmoid().item())
-                        _sp_alpha = _sp_alpha_base * _sp_sig
-                        # ──────────────────────────────────────────────────
-
-                        _bsz_sp = tx_signal.shape[0]
-                        _n_tokens_sp = tx_signal.shape[1]
-                        _d_sent_sp = tx_signal.shape[2]
-                        _l_sp = _n_tokens_sp * _d_sent_sp
-                        _t_sp = pack_stats["mimo_T"]
-
-
-                    if alloc_ctx is not None and "positions" in alloc_ctx:
-                        _tk_scores = self._resolve_stream_alloc_scores(
-                            tx_signal, selection_indices, selection_scores,
-                            _sp_source, _sp_prioritize_cls,
+                    if mode_alloc_enabled:
+                        # Pre-sample H so SVD and channel use the same realization
+                        bsz_ch = packed.shape[0]
+                        device_ch = packed.device
+                        compute_dtype = self.channel._compute_dtype(packed.dtype)
+                        h_pre = self.channel._sample_h(
+                            bsz_ch, device_ch, generator, compute_dtype,
                         )
-                        _flat_scores = _tk_scores.unsqueeze(-1).expand(
-                            _bsz_sp, _n_tokens_sp, _d_sent_sp
-                        ).reshape(_bsz_sp, _l_sp)
-                        _positions_sp = alloc_ctx["positions"]
-                        _l_pad_sp = self.channel.n_tx * _t_sp
-                        _sg = tx_signal.new_zeros((_bsz_sp, _l_pad_sp))
-                        _cg = tx_signal.new_zeros((_bsz_sp, _l_pad_sp))
-                        _of = tx_signal.new_ones((_bsz_sp, _l_sp))
-                        if _positions_sp.shape[1] > 0:
-                            _sg.scatter_(1, _positions_sp, _flat_scores)
-                            _cg.scatter_(1, _positions_sp, _of)
-                        _sg = _sg.reshape(_bsz_sp, self.channel.n_tx, _t_sp).sum(dim=2)
-                        _cg = _cg.reshape(_bsz_sp, self.channel.n_tx, _t_sp).sum(dim=2)
-                        _w_sp = _sg / _cg.clamp_min(1.0)
-                        _w_sp = (_w_sp.clamp(min=0.0) + _sp_eps) ** _sp_alpha
+                        packed_ma, ma_stats, mode_alloc_ctx = self._apply_mode_alloc(
+                            packed,
+                            h_pre,
+                            tx_signal=tx_signal,
+                            selection_indices=selection_indices,
+                            selection_scores=selection_scores,
+                            current_snr_db=_curr_snr,
+                        )
+                        if ma_stats.get("mode_alloc_enabled", False):
+                            packed = packed_ma
+                            h_override = h_pre
+                        info.update(ma_stats)
                     else:
-                        _w_sp = tx_signal.new_ones((_bsz_sp, self.channel.n_tx))
+                        info["mode_alloc_enabled"] = False
 
-                    _gains_sp = diagonal_gains if diagonal_gains is not None else tx_signal.new_ones((_bsz_sp, self.channel.n_tx))
-                    if _sp_gain_alpha != 0.0:
-                        _w_sp = _w_sp * _gains_sp.clamp_min(1e-6) ** _sp_gain_alpha
-                    _w_sp = _w_sp.clamp_min(1e-9)
-                    if _sp_max_ratio > 1.0:
-                        _mx = _w_sp.max(dim=1, keepdim=True).values
-                        _w_sp = torch.maximum(_w_sp, _mx / _sp_max_ratio)
-                    _w_sp = _w_sp / _w_sp.mean(dim=1, keepdim=True).clamp_min(1e-9)
-                    ch_kwargs["stream_power_weights"] = _w_sp
+                    ch_kwargs = {"selection_indices": selection_indices, "generator": generator}
+                    if h_override is not None:
+                        ch_kwargs["h_override"] = h_override
+                    elif diagonal_gains is not None:
+                        ch_kwargs["diagonal_gains"] = diagonal_gains
 
-                rx_packed, ch_stats = self.channel(packed, **ch_kwargs)
+                        # Propagate per-stream power weights to MMSE equaliser
+                        # so it uses the correct covariance (H^T H + σ² W^{-1})^{-1}
+                        if alloc_stats.get("stream_alloc_power_enabled", 0.0) > 0:
+                            # Recover the stream power weights from alloc_ctx
+                            # (the weights were applied to packed in _pack_mimo_symbols)
+                            _sp_cfg = (self.stream_alloc_cfg or {}).get("power", {}) or {}
+                            _sp_alpha_base = float(_sp_cfg.get("alpha", 1.0))
+                            _sp_eps   = float(_sp_cfg.get("eps", 1e-4))
+                            _sp_gain_alpha = float(_sp_cfg.get("gain_alpha", 1.0))
+                            _sp_max_ratio  = float(_sp_cfg.get("max_power_ratio", 10.0))
+                            _sp_source = str((self.stream_alloc_cfg or {}).get(
+                                "source", self.power_alloc_cfg.get("source", "selection_scores")))
+                            _sp_prioritize_cls = bool(((self.stream_alloc_cfg or {}).get(
+                                "assignment", {}) or {}).get("prioritize_cls", True))
+                            
+                            # ── SNR-ADAPTIVE ALPHA TEMPERING (MMSE SIDE) ──────
+                            _sp_snr_threshold = float(_sp_cfg.get("snr_threshold", 5.0))
+                            _sp_snr_slope     = float(_sp_cfg.get("snr_slope", 0.3))
+                            _sp_arg = -_sp_snr_slope * (_curr_snr - _sp_snr_threshold)
+                            _sp_sig = float(torch.tensor([_sp_arg]).sigmoid().item())
+                            _sp_alpha = _sp_alpha_base * _sp_sig
+                            # ──────────────────────────────────────────────────
 
-                # Unpack: mode_alloc reordering → standard MIMO unpack
-                if mode_alloc_ctx is not None:
-                    rx_signal = self._unpack_mode_alloc(
-                        rx_packed, mode_alloc_ctx, tx_signal.shape, pack_stats,
-                    )
+                            _bsz_sp = tx_signal.shape[0]
+                            _n_tokens_sp = tx_signal.shape[1]
+                            _d_sent_sp = tx_signal.shape[2]
+                            _l_sp = _n_tokens_sp * _d_sent_sp
+                            _t_sp = pack_stats["mimo_T"]
+
+
+                        if alloc_ctx is not None and "positions" in alloc_ctx:
+                            _tk_scores = self._resolve_stream_alloc_scores(
+                                tx_signal, selection_indices, selection_scores,
+                                _sp_source, _sp_prioritize_cls,
+                            )
+                            _flat_scores = _tk_scores.unsqueeze(-1).expand(
+                                _bsz_sp, _n_tokens_sp, _d_sent_sp
+                            ).reshape(_bsz_sp, _l_sp)
+                            _positions_sp = alloc_ctx["positions"]
+                            _l_pad_sp = self.channel.n_tx * _t_sp
+                            _sg = tx_signal.new_zeros((_bsz_sp, _l_pad_sp))
+                            _cg = tx_signal.new_zeros((_bsz_sp, _l_pad_sp))
+                            _of = tx_signal.new_ones((_bsz_sp, _l_sp))
+                            if _positions_sp.shape[1] > 0:
+                                _sg.scatter_(1, _positions_sp, _flat_scores)
+                                _cg.scatter_(1, _positions_sp, _of)
+                            _sg = _sg.reshape(_bsz_sp, self.channel.n_tx, _t_sp).sum(dim=2)
+                            _cg = _cg.reshape(_bsz_sp, self.channel.n_tx, _t_sp).sum(dim=2)
+                            _w_sp = _sg / _cg.clamp_min(1.0)
+                            _w_sp = (_w_sp.clamp(min=0.0) + _sp_eps) ** _sp_alpha
+                        else:
+                            _w_sp = tx_signal.new_ones((_bsz_sp, self.channel.n_tx))
+
+                        _gains_sp = diagonal_gains if diagonal_gains is not None else tx_signal.new_ones((_bsz_sp, self.channel.n_tx))
+                        if _sp_gain_alpha != 0.0:
+                            _w_sp = _w_sp * _gains_sp.clamp_min(1e-6) ** _sp_gain_alpha
+                        _w_sp = _w_sp.clamp_min(1e-9)
+                        if _sp_max_ratio > 1.0:
+                            _mx = _w_sp.max(dim=1, keepdim=True).values
+                            _w_sp = torch.maximum(_w_sp, _mx / _sp_max_ratio)
+                        _w_sp = _w_sp / _w_sp.mean(dim=1, keepdim=True).clamp_min(1e-9)
+                        ch_kwargs["stream_power_weights"] = _w_sp
+
+                    rx_packed, ch_stats = self.channel(packed, **ch_kwargs)
+
+                    # Unpack: mode_alloc reordering → standard MIMO unpack
+                    if mode_alloc_ctx is not None:
+                        rx_signal = self._unpack_mode_alloc(
+                            rx_packed, mode_alloc_ctx, tx_signal.shape, pack_stats,
+                        )
+                    else:
+                        rx_signal = self._unpack_mimo_symbols(
+                            rx_packed, tx_signal.shape, pack_stats, alloc_ctx,
+                        )
+                    pack_stats["mimo_n_rx"] = int(self.channel.n_rx)
+                    info.update(pack_stats)
+                    info.update(alloc_stats)
+                    info.update(ch_stats)
                 else:
-                    rx_signal = self._unpack_mimo_symbols(
-                        rx_packed, tx_signal.shape, pack_stats, alloc_ctx,
+                    rx_signal, ch_stats = self.channel(
+                        tx_signal,
+                        selection_indices=selection_indices,
+                        generator=generator,
                     )
-                pack_stats["mimo_n_rx"] = int(self.channel.n_rx)
-                info.update(pack_stats)
-                info.update(alloc_stats)
-                info.update(ch_stats)
-            else:
-                rx_signal, ch_stats = self.channel(
-                    tx_signal,
-                    selection_indices=selection_indices,
-                    generator=generator,
-                )
-                info.update(ch_stats)
+                    info.update(ch_stats)
         else:
             rx_signal = tx_signal
             

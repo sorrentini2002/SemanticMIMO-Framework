@@ -521,9 +521,72 @@ class Store_Class_Token_Attn_Wrapper(nn.Module):
         return x
 
 
+
 # ============================================================
-# OUTER MODEL  (minimal changes: exposes register_epoch)
+# Attn_Entropy_Wrapper — Server-side attention entropy capture
 # ============================================================
+
+class Attn_Entropy_Wrapper(nn.Module):
+    """
+    Wraps a timm Attention module on the server side to capture
+    the per-forward Shannon entropy of the softmax attention matrix.
+
+    The wrapper replicates the full Attention forward pass verbatim
+    so that gradients and outputs are identical to the unwrapped module.
+    After each forward the scalar mean entropy (averaged over batch,
+    heads, and query positions) is stored in ``self.last_entropy``.
+
+    Metric definition:
+        For attention matrix A ∈ R^{B×H×N×N} (post-softmax):
+            H_q = -Σ_k A[b,h,q,k] * log(A[b,h,q,k] + ε)   [per query]
+            scalar = mean over b, h, q
+        Unit: nats.  Higher entropy → more uniform / noise-dominated attention.
+
+    Note:
+        - The entropy is computed inside torch.no_grad() to avoid adding
+          any gradient computation overhead.
+        - This wrapper is ONLY attached to server-side blocks (post-channel).
+          Client-side blocks remain unwrapped.
+    """
+
+    _ENTROPY_EPS: float = 1e-9  # prevent log(0)
+
+    def __init__(self, attn: nn.Module):
+        super().__init__()
+        self.attn = attn
+        self.last_entropy: float = 0.0  # updated every forward
+
+    def forward(self, x: torch.Tensor, attn_mask: torch.Tensor | None = None, **kwargs) -> torch.Tensor:
+        B, N, C = x.shape
+
+        # ── Replicate timm Attention.forward exactly ──────────────────
+        qkv = (
+            self.attn.qkv(x)
+            .reshape(B, N, 3, self.attn.num_heads, self.attn.head_dim)
+            .permute(2, 0, 3, 1, 4)
+        )
+        q, k, v = qkv.unbind(0)
+        q, k = self.attn.q_norm(q), self.attn.k_norm(k)
+
+        q = q * self.attn.scale
+        attn_logits = q @ k.transpose(-2, -1)       # [B, H, N, N]
+        if attn_mask is not None:
+            attn_logits = attn_logits + attn_mask
+        attn_weights = attn_logits.softmax(dim=-1)  # [B, H, N, N]
+
+        # ── Capture entropy (no-grad) ──────────────────────────────────
+        with torch.no_grad():
+            log_a = torch.log(attn_weights + self._ENTROPY_EPS)
+            entropy_per_query = -(attn_weights * log_a).sum(dim=-1)  # [B, H, N]
+            self.last_entropy = float(entropy_per_query.mean().item())
+
+        # ── Complete the forward pass ──────────────────────────────────
+        attn_weights = self.attn.attn_drop(attn_weights)
+        attn_out = attn_weights @ v                              # [B, H, N, head_dim]
+        x = attn_out.transpose(1, 2).reshape(B, N, C)
+        x = self.attn.proj(x)
+        x = self.attn.proj_drop(x)
+        return x
 
 class model(nn.Module):
     def __init__(self,
@@ -557,6 +620,9 @@ class model(nn.Module):
 
         self.compressor_module = None
         self.clean_validation  = False
+        # Initialise before build_model so the reference is available
+        # if build_model needs it; populated inside build_model.
+        self._server_attn_wrappers: list = []  # list[Attn_Entropy_Wrapper]
 
         self.model = self.build_model(model, channel, split_index, self.method_cfg)
         self.channel = channel
@@ -593,6 +659,18 @@ class model(nn.Module):
             if not compression_enabled and hasattr(channel, "comm"):
                 channel.comm.use_bottleneck = False
 
+        # ── Install Attn_Entropy_Wrapper on server-side blocks ────────
+        # Server blocks are those AFTER the channel in model.blocks.
+        # model.blocks = [client_blocks..., channel, server_blocks...]
+        # channel is at index split_index (0-based after rebuild).
+        entropy_wrappers = []
+        for block in blocks_after:
+            if hasattr(block, 'attn'):
+                block.attn = Attn_Entropy_Wrapper(block.attn)
+                entropy_wrappers.append(block.attn)
+        # Store reference on self for aggregation in forward()
+        self._server_attn_wrappers = entropy_wrappers
+
         return model
 
     # ------------------------------------------------------------------
@@ -603,4 +681,18 @@ class model(nn.Module):
         batch_size = x.shape[0]
         if self.training:
             self.communication += self.compression_ratio * batch_size
-        return self.model.forward(x)
+
+        out = self.model.forward(x)
+
+        # ── Aggregate server-side attention entropy ───────────────────
+        # After the forward pass, all Attn_Entropy_Wrapper instances have
+        # stored their per-block entropy in .last_entropy.  Compute the
+        # global mean across all server blocks (single scalar per forward).
+        if self._server_attn_wrappers:
+            entropies = [w.last_entropy for w in self._server_attn_wrappers]
+            avg_entropy = sum(entropies) / len(entropies)
+            # Write into channel's last_info so training/eval loops can log it.
+            if hasattr(self.channel, "last_info") and isinstance(self.channel.last_info, dict):
+                self.channel.last_info["server_attn_entropy"] = avg_entropy
+
+        return out

@@ -1,28 +1,19 @@
 # ============================================================
-# comm/__init__.py — Public API of the comm package
+# comm/__init__.py
 # ============================================================
-# Import order matters: mimo and bottleneck have no internal
-# cross-dependencies, so they are loaded first.
+# Public API for the comm package.
 # ============================================================
 
-"""Local communication package for split-learning channels."""
-
-# --- Core physical-layer building blocks ---
-from .bottleneck import Bottleneck
-from .mimo import (
-    MIMOAWGNChannel,
-    pack_tokens_to_mimo_symbols,
-    unpack_mimo_symbols_to_tokens,
-)
-
-# --- Legacy / simple channel classes ---
-from .communication import (
-    Gaussian_Noise_Analogic_Channel,
-    Identity,
-)
-
-# --- Advanced orchestrator (bottleneck + channel + power alloc) ---
 from .comm_module import CommModule
-
-# --- nn.Sequential-compatible wrapper around CommModule ---
 from .comm_module_wrapper import CommModuleWrapper
+from .dct import build_dct_matrix, apply_dct_spatial, apply_idct_spatial, clear_dct_cache
+
+__all__ = [
+    "CommModule",
+    "CommModuleWrapper",
+    # DCT Spatial Diversity helpers
+    "build_dct_matrix",
+    "apply_dct_spatial",
+    "apply_idct_spatial",
+    "clear_dct_cache",
+]

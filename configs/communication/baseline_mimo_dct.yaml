@@ -1,0 +1,77 @@
+# ============================================================
+# configs/communication/baseline_mimo_dct.yaml
+# ============================================================
+# MIMO channel with DCT Spatial Diversity.
+#
+# Key differences from baseline_mimo_svd:
+#   - transmission_mode: dct_spatial  → activates the DCT path in CommModule
+#   - dct_spatial config block        → prune threshold in dB
+#   - mode_alloc.enabled: false       → ISW mode allocation is fully bypassed
+#   - power_alloc.enabled: false      → equal power (uniform) allocation
+#   - semantic_waterfilling is still
+#     irrelevant at the CommModule level (scores are ignored in DCT path)
+#
+# The physical channel (Y=HS+N), n_tx/n_rx, fading, and equalizer are
+# IDENTICAL to baseline_mimo_svd for fair comparison.
+# ============================================================
+
+name: baseline_mimo_dct
+eval:
+  snr_sweep: [-5, 0, 10, 20]
+
+channel:
+  _target_: comm.comm_module_wrapper.CommModuleWrapper
+  input_dim: 192
+  config:
+    comm: ${communication.comm}
+
+
+comm:
+  enabled: true
+  bottleneck:
+    enabled: false
+    out_dim: 128
+  channel:
+    enabled: true
+    type: "mimo"
+    n_tx: 4
+    n_rx: 4
+    fading: "rayleigh"
+    equalizer: "mmse"
+    snr_db: [-10, 20]
+    train_mode: "sampled"
+    sample_mode: "per_sample"
+    normalize: true
+    normalization_mode: "sample"
+
+    # ── DCT Spatial Diversity ────────────────────────────────────────
+    transmission_mode: "dct_spatial"   # activates _forward_dct_spatial()
+    dct_spatial:
+      # Prune spatial modes whose singular value falls below this dB
+      # threshold relative to the strongest mode.
+      # Default: -20 dB ↔ relative amplitude threshold of 0.1
+      # (same effective floor as the ISW path's sigma_rel_threshold: 0.1).
+      prune_enabled: true
+      prune_snr_threshold_db: -20.0
+
+    # SVD eps is inherited from mode_alloc.svd.eps for _compute_svd_modes().
+    # Kept here for schema completeness even though mode_alloc is disabled.
+    mode_alloc:
+      enabled: false          # ISW importance-to-modes mapping: OFF
+      strategy: "importance_to_modes"
+      svd:
+        per_sample: true
+        eps: 1.0e-6           # used by _compute_svd_modes() in DCT path too
+      assignment:
+        enabled: false
+      power:
+        enabled: false
+      num_modes: null
+
+    # Equal power allocation (uniform) — ISW waterfilling: OFF
+    power_alloc:
+      enabled: false
+      source: "selection_scores"
+      alpha: 1.0
+      eps: 1.0e-4
+      apply_to_cls: false

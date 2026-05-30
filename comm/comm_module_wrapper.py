@@ -185,6 +185,16 @@ class CommModuleWrapper(nn.Module):
         # Ora passiamo esplicitamente selection_indices per permettere il routing spaziale
         out, info = self.comm(x, selection_indices=selection_indices, selection_scores=selection_scores)
         
+        # ── CLS MSE Metric ────────────────────────────────────────────────
+        # Measure CLS token reconstruction fidelity (both ISW and DCT modes).
+        # x is already RMS-normalised, so we measure distortion on the
+        # normalised signal — consistent across SNR sweeps.
+        if x.shape[1] > 0 and out.shape[1] > 0:
+            cls_tx = x[:, 0, :]        # [B, D] — CLS before channel
+            cls_rx = out[:, 0, :]      # [B, D] — CLS after channel
+            info["cls_mse"] = float(torch.mean((cls_tx - cls_rx) ** 2).item())
+        # ─────────────────────────────────────────────────────────────────
+        
         
         # =====================================================================
         # DIAGNOSTICS PHASE 3: Payload Integrity (Channel Impact)
