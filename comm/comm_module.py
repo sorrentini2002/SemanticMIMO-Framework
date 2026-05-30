@@ -1152,6 +1152,13 @@ class CommModule(nn.Module):
                 T_2_vec[b] = 0
 
         T_b_vec = T_1_vec + T_2_vec
+        
+        # FIX: For k_b=1 cases, T_b must equal n_tokens * d_sent (all tokens on single mode)
+        for b in range(bsz):
+            k_b = int(k_b_vec[b].item())
+            if k_b == 1:
+                T_b_vec[b] = n_tokens * d_sent  # Correct timing for single-mode transmission
+        
         T_max = int(T_b_vec.max().item())
         T_max = max(1, T_max)
 
