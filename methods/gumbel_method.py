@@ -276,20 +276,28 @@ class Gumbel_Token_Selection_Block_Wrapper(nn.Module):
         base_patch_scores = cls_attention[:, 1:]   # [B, N-1]
 
         # ==========================================
-        # 1. SIMPLICIAL SCORING (unchanged)
+        # 1. ABLATION STUDY: LAYER NORM NATIVE ATTENTION (MODIFIED)
         # ==========================================
         cls_token    = x[:, 0:1, :]    # [B, 1, D]
         patch_tokens = x[:, 1:, :]     # [B, N-1, D]
 
-        m_cls     = self.w_u(cls_token)       # [B, 1, D]
-        patch_tri = self.w_tri(patch_tokens)  # [B, N-1, D]
+        # Bypass geometric branch: y_context and affine parameters are ignored
 
-        y_tri_raw  = torch.norm(m_cls * patch_tri, p=2, dim=-1)   # [B, N-1]
-        y_tri_norm = F.layer_norm(y_tri_raw, y_tri_raw.shape[-1:])
-        y_tri      = y_tri_norm * self.branch_norm_weight + self.branch_norm_bias
-
-        x_std       = base_patch_scores
-        raw_logits  = (self.beta * x_std) + (torch.sigmoid(self.gate_param) * self.gamma * y_tri)
+        # Inject LayerNorm directly into native attention scores (base_patch_scores)
+        a_cls_norm = F.layer_norm(base_patch_scores, base_patch_scores.shape[-1:])
+        
+        # To avoid breaking DDP (unused parameters crash) if find_unused_parameters=False,
+        # we attach a 0.0-weighted dummy term combining bypassed parameters.
+        dummy_ddp = (self.w_u.weight.sum() + self.w_tri.weight.sum() + self.w_u.bias.sum() + self.w_tri.bias.sum() +
+                     self.gamma.sum() + self.gate_param.sum() + 
+                     self.branch_norm_weight.sum() + self.branch_norm_bias.sum()) * 0.0
+        
+        # Only self.beta acts as scalar multiplier
+        raw_logits = self.beta * a_cls_norm + dummy_ddp
+        
+        # Mock values for bypassed computations to maintain compatibility with diagnostics
+        y_tri_raw  = torch.zeros_like(base_patch_scores)
+        y_tri_norm = torch.zeros_like(base_patch_scores)
 
         # ==========================================
         # 2. LOGIT SCALING DINAMICO (NEW)
@@ -318,6 +326,7 @@ class Gumbel_Token_Selection_Block_Wrapper(nn.Module):
                 ema_centered = ema - ema.mean()
                 final_logits = final_logits + self.stability_bonus_weight * ema_centered.unsqueeze(0)
 
+        self.last_full_logits = final_logits.detach()
         # Soft probabilities (for entropy computation and ADC scores)
         patch_scores_probs = F.softmax(final_logits, dim=-1)   # [B, N-1]
 

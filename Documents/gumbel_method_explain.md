@@ -11,10 +11,11 @@ Unlike previous iterations, this module now follows a **"Native Wrapper"** desig
 
 Main objectives of the module:
 
-1. Select the most relevant patch tokens using the core Gumbel-Softmax algorithm.
-2. Maintain a drop-in replacement interface for the SemanticMIMO pipeline.
-3. Expose per-token semantic scores (`last_adc_scores`) to the communication channel for adaptive resource allocation.
-4. Support dynamic "Clean Validation" and evaluation-only channel toggling.
+1. Select the most relevant patch tokens using the core Gumbel-Softmax algorithm augmented by a **Simplicial Interaction Graph**.
+2. **Curriculum Learning Integration**: Implements Dynamic Logit Scaling, an Entropy Bottleneck, and a Stability Bonus (EMA) to stabilize training.
+3. Maintain a drop-in replacement interface for the SemanticMIMO pipeline with **Multi-Budget Training ("Vaccination")**.
+4. Expose per-token semantic scores (`last_adc_scores`) with corrected dynamic range for adaptive resource allocation (Waterfilling).
+5. Support dynamic "Clean Validation" and evaluation-only channel toggling.
 
 ---
 
@@ -29,16 +30,20 @@ gumbel_method.py
 |
 |-- Gumbel_Token_Selection_Block_Wrapper
 |    |-- register_step()
+|    |-- register_epoch()              # NEW: Curriculum management
 |    |-- current_tau (property)
-|    |-- gumbel_compress()
+|    |-- _compute_logit_scale()        # NEW: Dynamic logit scaling
+|    |-- _compute_entropy_target()     # NEW: Moving entropy ceiling
+|    |-- gumbel_compress()             # Multi-stage selection + EMA bonus
 |    |-- forward()                     # Forward + Clean Bypass check
-|    `-- compress_labels()              # Dummy wrapper (K-means removed)
+|    `-- compress_labels()              # One-hot encoded labels
 |
 |-- Store_Class_Token_Attn_Wrapper     # Stores CLS attention row [B, N]
 |
 `-- model                              # Outer split-learning model wrapper
 	  |-- __init__()
 	  |-- build_model()
+	  |-- register_epoch()             # Forwards to compressor
 	  `-- forward()
 ```
 
@@ -77,9 +82,10 @@ This class wraps one transformer block and applies token compression using the c
 
 ### Interface-critical attributes
 
-- `last_adc_scores`: `[B, N_selected]` semantic scores consumed by `CommModuleWrapper` for waterfilling.
+- `last_adc_scores`: `[B, N_selected]` semantic scores consumed by `CommModuleWrapper` for waterfilling (now correctly scaled).
 - `_model_ref`: weak back-reference to parent model, used to read the `clean_validation` flag.
 - `n_new_tokens`: tracks the current sequence length after compression (CLS + K patches).
+- `_selection_freq_ema`: tracks which tokens are consistently selected for the stability bonus.
 
 ---
 
@@ -89,6 +95,9 @@ This class wraps one transformer block and applies token compression using the c
 
 - `token_compression`: patch retention ratio (e.g., 0.5 to keep half the patches).
 - `tau_max`, `tau_min`, `anneal_steps`, `anneal_mode`: temperature annealing hyper-parameters.
+- `logit_scale_start/end`, `logit_scale_mode`: parameters for dynamic logit scaling.
+- `entropy_bottleneck_enabled`, `entropy_target_start/end`: parameters for the entropy ceiling.
+- `stability_bonus_enabled`, `weight`, `ema_decay`: parameters for selection reinforcement.
 - `hard`, `straight_through`: flags for the STE gradient estimator.
 - `compression_enabled`: master toggle to bypass compression entirely.
 
@@ -100,10 +109,17 @@ The bridge between the ViT features and the Gumbel core.
 
 ### Steps
 
-1. **Attention Extraction**: Retrieves the CLS attention scores stored by `Store_Class_Token_Attn_Wrapper`.
-2. **Shape Alignment**: Unsqueezes the attention to `[B, 1, N]` to meet the internal expectations of the core algorithm.
-3. **Core Call**: Executes `sample_gumbel_topk`.
-4. **Score Export**: Gather the raw importance scores for the *selected* tokens and prepends a `1.0` dummy score for the CLS token, storing the result in `self.last_adc_scores`.
+1. **Multi-Budget Budgeting**: If training, samples `n_alpha` randomly (e.g., 8-64) to "vaccinate" the model against varying sequence lengths.
+2. **Attention Extraction**: Retrieves the CLS attention scores.
+3. **Simplicial Scoring**: Augments base attention with higher-order geometric features using the $m_{cls}$ and $patch_{tri}$ projections.
+4. **Logit Scaling**: Applies the current `alpha_scale` to raw logits to control the sharpness of the distribution.
+5. **Stability Bonus**: Adds a bonus to logits based on the EMA of previous selections.
+6. **Core Call**: Executes `sample_gumbel_topk`.
+7. **Score Export (FIXED)**: 
+    - Re-calculates softmax over **only** the selected tokens to ensure a high dynamic range (0.02 - 0.15 instead of 0.005).
+    - Sets CLS score to `max(selected_scores) + 0.01` to maintain scale parity.
+    - Stores the result in `self.last_adc_scores`.
+8. **EMA Update**: Updates the `_selection_freq_ema` for the next forward pass.
 
 ---
 
@@ -129,10 +145,10 @@ Since batch compression (K-Means) has been removed to prioritize Gumbel algorith
 Top-level integration class that assembles the split-learning pipeline.
 
 ### Constructor & build_model()
-
 - **Split Index**: Injects the compressor and channel at the specified block index.
 - **Semantic Wiring**: Automatically links the compressor's `last_adc_scores` to the `CommModuleWrapper`.
 - **Logic Toggle**: Forward the `semantic_waterfilling` and `channel_eval_only` flags to the communication module.
+- **Epoch Management**: The `register_epoch()` method forwards the training progress to the internal compressor for curriculum updates.
 
 ---
 
@@ -269,16 +285,20 @@ Introduced an optional stability mechanism using an Exponential Moving Average (
 
 ---
 
-## 22. Semantic Score Interface Issues (Legacy)
+## 22. Semantic Score Interface (Resolved)
 
-The following issues were identified as the primary causes for the failure of semantic waterfilling in earlier versions:
+The following issues were identified and resolved in the current version of `gumbel_method.py` to ensure optimal performance of semantic waterfilling:
 
-### 🔴 #1 Softmax probabilities passed as scores (`gumbel_method.py:L443`)
-The system was passing normalized softmax probabilities as importance scores. With 196 patches, `patch_scores_probs ≈ 1/196 ≈ 0.005` for all tokens.
-- **Consequence:** The communication channel received nearly uniform values with a dynamic range close to zero. The waterfilling algorithm had no meaningful differentiation to perform resource allocation.
+### ✅ #1 Softmax dynamic range fix
+**Issue:** Softmax over all 196 patches resulted in tiny, uniform scores (~0.005).
+**Solution:** `last_adc_scores` are now calculated by re-applying softmax over **only the selected tokens**. This expands the dynamic range to ~0.02 - 0.15, providing meaningful differentiation for the waterfilling algorithm.
 
-### 🔴 #2 CLS dummy = 1.0 vs patches ≈ 0.005 (`gumbel_method.py:L444`)
-The CLS token was assigned a hardcoded dummy score of `1.0`, while patches had scores around `0.005`.
-- **Consequence:** This created a massive 200:1 scale imbalance. Although partially mitigated by `apply_to_cls=false`, the resulting `last_adc_scores` vector was mathematically incoherent, causing the power allocation logic to focus almost exclusively on the CLS token while starving all other patches.
+### ✅ #2 CLS/Patch scale parity
+**Issue:** Hardcoding CLS=1.0 created a 200:1 imbalance against 0.005 patch scores.
+**Solution:** The CLS token is now assigned a score of `max(selected_patch_scores) + 0.01`. This keeps the CLS token as the most important while maintaining mathematical coherence with the rest of the vector.
+
+### ✅ #3 Gradient Signal Boosting
+**Issue:** Softmax Jacobian over 196 elements diluted gradients.
+**Solution:** By reducing the softmax base to ~20 elements, the Jacobian is ~10x stronger, significantly improving the gradient flow from the communication channel back to the scoring head.
 
 

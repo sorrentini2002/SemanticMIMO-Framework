@@ -4,6 +4,11 @@ import hydra
 import torch 
 import json 
 from tqdm import tqdm
+import numpy as np
+import matplotlib
+matplotlib.use('Agg')          # non-interactive backend (no display needed)
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
 
 # Custom functions 
 from omegaconf import OmegaConf
@@ -170,6 +175,114 @@ def validation_phase(model, val_data_loader, loss, device, plot):
 
     return average_val_loss, average_val_accuracy, average_epoch_stats
 
+# ============================================================
+# VISUALIZATION
+# ============================================================
+
+def save_visualization(model, val_loader, device, hydra_output_dir,
+                       split_index, n_samples=4):
+    """
+    Generate *visual_comp_random.png*: a (n_samples × 2) grid comparing,
+    for each sample image:
+      - Column 1  – Original Image (Clean)
+      - Column 2  – Original + GREEN overlay of Gumbel-selected patches
+    """
+    import random
+    import numpy as np
+    import os
+    import torch
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as mpatches
+    
+    GRID_SIZE = 14                       # 224 / 16 = 14 patches per side
+    IMG_SIZE  = 224
+    PATCH_PX  = IMG_SIZE // GRID_SIZE    # 16 px per patch
+
+    # --- Collect randomly n_samples images ---------------------------
+    dataset = val_loader.dataset
+    total_samples = len(dataset)
+    random_indices = random.sample(range(total_samples), n_samples)
+    
+    images = []
+    for idx in random_indices:
+        img, _ = dataset[idx]  # Ignoriamo la label
+        images.append(img)
+        
+    images = torch.stack(images, dim=0).to(device)  # [n, 3, 224, 224]
+
+    # --- UNICO Forward pass (eval, no grad) -------------------------
+    model.eval()
+    with torch.no_grad():
+        _ = model(images)
+
+    # --- Extract Gumbel selection indices ---------------------------
+    gumbel_indices = model.compressor_module.last_indices_sel.cpu()  # [n, 1+K]
+    gumbel_patch_ids = gumbel_indices[:, 1:] - 1                     # [n, K]
+    K = gumbel_patch_ids.shape[1]
+
+    # --- Denormalise images for display -----------------------------
+    mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+    std  = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+    imgs_display = images.cpu() * std + mean
+    imgs_display = imgs_display.clamp(0, 1)
+
+    # --- Helper: build RGBA overlay from a set of patch indices -----
+    def _build_overlay(patch_ids_1d, color_rgb, alpha=0.4):
+        overlay = np.zeros((IMG_SIZE, IMG_SIZE, 4), dtype=np.float32)
+        for pid in patch_ids_1d:
+            pid = int(pid)
+            if pid < 0 or pid >= GRID_SIZE * GRID_SIZE:
+                continue
+            row = pid // GRID_SIZE
+            col = pid % GRID_SIZE
+            y0, y1 = row * PATCH_PX, (row + 1) * PATCH_PX
+            x0, x1 = col * PATCH_PX, (col + 1) * PATCH_PX
+            overlay[y0:y1, x0:x1, :3] = color_rgb
+            overlay[y0:y1, x0:x1, 3]  = alpha
+        return overlay
+
+    # --- Build the figure -------------------------------------------
+    fig, axes = plt.subplots(n_samples, 2, figsize=(8, 4 * n_samples),
+                             constrained_layout=True)
+    if n_samples == 1:
+        axes = axes[np.newaxis, :]   # ensure 2-D indexing
+
+    GREEN = np.array([0.0, 0.85, 0.25])
+
+    for i in range(n_samples):
+        img_np = imgs_display[i].permute(1, 2, 0).numpy()   # [H, W, 3]
+
+        # --- Column 0: Original Image (Pulita) ---
+        ax = axes[i, 0]
+        ax.imshow(img_np) # Solo sfondo: immagine originale
+        ax.set_title(f"Sample {i+1} — Original Image",
+                     fontsize=10, fontweight='bold')
+        ax.axis('off')
+
+        # --- Column 1: Gumbel-selected patches (green) ---
+        ax = axes[i, 1]
+        ax.imshow(img_np) # Sfondo: immagine originale
+        overlay_g = _build_overlay(gumbel_patch_ids[i], GREEN, alpha=0.4)
+        ax.imshow(overlay_g)
+        ax.set_title(f"Sample {i+1} — Gumbel selection (K={K})",
+                     fontsize=10, fontweight='bold')
+        ax.axis('off')
+
+    # --- Legend ------------------------------------------------------
+    legend_handles = [
+        mpatches.Patch(facecolor=GREEN, alpha=0.6, label='Gumbel-selected patches'),
+    ]
+    fig.legend(handles=legend_handles, loc='lower center', ncol=1,
+               fontsize=11, frameon=True, fancybox=True, shadow=True)
+
+    fig.suptitle('Original Image vs Patch Selection',
+                 fontsize=14, fontweight='bold', y=1.01)
+
+    # --- Save --------------------------------------------------------
+    save_path = os.path.join(hydra_output_dir, "visual_comp_random.png")
+    fig.savefig(save_path, dpi=180, bbox_inches='tight',
+                facecolor='white', edgecolor='none')
+    plt.close(fig)
 
 # ============================================================
 # TRAINING SCHEDULE
@@ -323,16 +436,18 @@ def training_schedule(model, train_data_loader, val_data_loader,
                 if top_imp_frac is None:
                     top_imp_frac = train_stats.get("mode_alloc_top_imp_frac",
                                                    train_stats.get("stream_alloc_top_imp_frac", 0.0))
+                
                 best_stats = {
                     "best_epoch": epoch,
                     "best_train_accuracy": avg_train_accuracy,
                     "best_train_loss": avg_train_loss,
                     "best_communication_cost": model.communication,
                     "top_imp_frac": top_imp_frac,
-                    "tokens_sent":   repr_v_stats.get("tokens_sent", train_stats.get("tokens_sent", 0)),
-                    "symbols_sent":  repr_v_stats.get("mimo_L", train_stats.get("mimo_L", 0)),
-                    "symbol_rate":   repr_v_stats.get("rate_symbols", train_stats.get("rate_symbols", 0.0))
+                    "tokens_sent":  repr_v_stats.get("tokens_sent", train_stats.get("tokens_sent", 0)),
+                    "symbols_sent": repr_v_stats.get("mimo_L", train_stats.get("mimo_L", 0)),
+                    "symbol_rate":  repr_v_stats.get("rate_symbols", train_stats.get("rate_symbols", 0.0))
                 }
+                
                 if snr_sweep and hasattr(model, "channel") and hasattr(model.channel, "reconfigure"):
                     best_stats["best_val_accuracy"] = val_acc_dict
                     best_stats["best_val_loss"]     = val_loss_dict
@@ -344,11 +459,26 @@ def training_schedule(model, train_data_loader, val_data_loader,
                     best_stats["best_val_loss"]     = avg_val_loss
                     for k, v in repr_v_stats.items():
                         best_stats[f"best_val_{k}"] = v
+                
                 for k, v in train_stats.items():
                     best_stats[f"best_train_{k}"] = v
 
                 with open(best_results_file, "w") as f:
                     json.dump(best_stats, f, indent=4)
+
+                if hasattr(model, 'compressor_module') and \
+                   hasattr(model.compressor_module, 'last_indices_sel'):
+                    try:
+                        split_idx_val = cfg.hyperparameters.split_index
+                        save_visualization(
+                            model, val_data_loader, device,
+                            hydra_output_dir, split_idx_val,
+                            n_samples=4,
+                        )
+                    except Exception as e:
+                        print(f"  Visualisation failed: {e}")
+                    finally:
+                        model.train() 
 
             if plot:
                 print(f"\nTrain loss: {avg_train_loss:.4f}; Val loss: {avg_val_loss:.4f}")
@@ -543,11 +673,132 @@ def main(cfg):
             f"  → {cfg.method.parameters.get('entropy_target_end', 2.0)}\n"
         )
 
-        hydra_output_dir = hydra.core.hydra_config.HydraConfig.get().runtime.output_dir
+        # ================================================================
+        # NEW: Hierarchical directory structure
+        # Structure: results/{dataset}/seed_{seed}/split_{split}/{channel_type}/{method_type}/compression_{compression}/{optional_title}
+        # ================================================================
+        results_path = cfg.core.get('results_path', './results')
+        dataset_name = cfg.dataset.name
+        split_index = cfg.hyperparameters.split_index
+        
+        # Extract channel type from communication.name
+        comm_name = cfg.communication.name.lower()
+        if 'mimo' in comm_name:
+            channel_type = 'MIMO'
+        elif comm_name == 'clean':
+            channel_type = 'None'
+        else:
+            channel_type = 'AWGN'
+        
+        # Extract method type from method.name
+        method_name = cfg.method.name.lower()
+        if 'gumbel' in method_name:
+            method_type = 'Gumbel'
+        elif 'random' in method_name:
+            method_type = 'Random'
+        else:
+            method_type = cfg.method.name
+        
+        # ================================================================
+        # COMMUNICATION VARIANT CLASSIFICATION
+        # Classifica la variante di comunicazione basata su config
+        # ================================================================
+        comm_name = cfg.communication.name.lower()
+        
+        # Check for mode and power allocation flags
+        has_mode_alloc = False
+        has_power_alloc = False
+        
+        if hasattr(cfg.communication.comm, 'channel') and hasattr(cfg.communication.comm.channel, 'mode_alloc'):
+            mode_alloc = cfg.communication.comm.channel.mode_alloc
+            has_mode_alloc = mode_alloc.enabled if hasattr(mode_alloc, 'enabled') else False
+        
+        if hasattr(cfg.communication.comm, 'channel') and hasattr(cfg.communication.comm.channel, 'power_alloc'):
+            power_alloc = cfg.communication.comm.channel.power_alloc
+            has_power_alloc = power_alloc.enabled if hasattr(power_alloc, 'enabled') else False
+        
+        # Determine communication variant
+        if 'dct' in comm_name:
+            comm_variant = 'DCT'
+        elif 'svd' in comm_name:
+            comm_variant = 'ISW'
+        elif 'dct' in comm_name or 'isw' in comm_name:
+            # Has dct/isw but no mode/power allocation → Base
+            if not has_mode_alloc and not has_power_alloc:
+                comm_variant = 'Base'
+            else:
+                comm_variant = 'ISW' if 'isw' in comm_name else 'DCT'
+        else:
+            # Generic fallback: use communication name or "Other"
+            comm_variant = comm_name.replace('baseline_mimo_', '').upper() if 'baseline' in comm_name else 'Other'
+        
+        # ================================================================
+        # AUTOMATIC TOKEN TRANSMISSION CALCULATION
+        # Tokens transmitted = input_dim (total tokens) × desired_compression (ratio)
+        # Example: 192 × 0.1 = 19.2 ≈ 19 tokens transmitted
+        # ================================================================
+        
+        # Get total tokens from config (communication.channel.input_dim)
+        total_tokens = cfg.communication.channel.input_dim if hasattr(cfg.communication.channel, 'input_dim') else 192
+        
+        # Get compression ratio from config (method.parameters.desired_compression)
+        compression_ratio = None
+        if hasattr(cfg, 'method') and isinstance(cfg.method, dict) is False:
+            # OmegaConf dict-like - use get
+            compression_ratio = cfg.method.parameters.get('desired_compression') if cfg.method.parameters is not None else None
+            if compression_ratio is None:
+                compression_ratio = cfg.method.parameters.get('token_compression') if cfg.method.parameters is not None else None
+        else:
+            # Generic fallback for plain dict-like
+            compression_ratio = cfg.get('desired_compression', None)
 
-        if seed != 42:
-            hydra_output_dir = hydra_output_dir.replace('prova', f'prova_{seed}')
+        if compression_ratio is None:
+            compression_ratio = getattr(model, 'compression_ratio', None)
 
+        # Calculate transmitted tokens: int(total_tokens × compression_ratio)
+        try:
+            if isinstance(compression_ratio, (int, float)) and compression_ratio > 0:
+                # Assume compression_ratio is already a decimal (e.g., 0.1 = 10%)
+                transmitted_tokens = int(round(total_tokens * float(compression_ratio)))
+            else:
+                # Fallback: treat as already being the transmitted token count
+                transmitted_tokens = int(float(compression_ratio)) if compression_ratio is not None else total_tokens
+        except Exception:
+            transmitted_tokens = total_tokens
+
+        compression_val = transmitted_tokens
+        
+        # Optional custom title from experiment_name (only if not 'test')
+        experiment_name = cfg.hyperparameters.get('experiment_name', 'test')
+        custom_title = experiment_name if experiment_name != 'test' else ''
+        
+        # Build hierarchical path matching results directory structure
+        # Special handling for baseline: save at seed level for easy plotting
+        if method_type.lower() == "baseline":
+            hydra_output_dir = os.path.join(
+                results_path,
+                dataset_name,
+                f'seed_{seed}',
+                'Baseline'
+            )
+        else:
+            # Structure: {method_type}/compression_{value}/{comm_variant}
+            # This matches the actual directory layout where variants are under compression
+            hydra_output_dir = os.path.join(
+                results_path,
+                dataset_name,
+                f'seed_{seed}',
+                f'split_{split_index}',
+                channel_type,
+                method_type,
+                f'compression_{compression_val}',
+                comm_variant
+            )
+        
+        if custom_title and method_type.lower() != "baseline":
+            hydra_output_dir = os.path.join(hydra_output_dir, custom_title)
+        
+        # Handle duplicate runs by appending counter
         base_dir = hydra_output_dir
         counter = 1
         while os.path.exists(os.path.join(hydra_output_dir, "final_training_results.json")) or \
