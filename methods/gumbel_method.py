@@ -248,14 +248,26 @@ class Gumbel_Token_Selection_Block_Wrapper(nn.Module):
         return (self.entropy_target_start
                 + (self.entropy_target_end - self.entropy_target_start) * t)
 
+
     # ------------------------------------------------------------------
-    # Gumbel token selection
+    # Gumbel token selection (ADDITIVE HYBRID STRATEGY)
     # ------------------------------------------------------------------
+
 
     def gumbel_compress(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Perform Gumbel-Softmax token selection on the output of the
-        transformer block, with curriculum learning extensions.
+        COOPERATIVE JSCC STRATEGY (Gate * Gamma).
+        
+        Formula: z = LN(a_cls) + sigmoid(g) * gamma * LN(y_raw)
+        
+        Where:
+        - a_cls = Native DeiT attention scores from the class token [B, N-1]
+        - y_raw = || W_u(X_cls) ⊙ W_tri(X_patch) ||_2  [Projected geometric interaction]
+        - LN(·) = Layer Normalization applied independently to BOTH branches 
+                  to ensure a perfectly balanced numeric initialization.
+        - sigmoid(g) ∈ (0, 1) = Soft-gate to control channel noise filtration.
+        - gamma = Learnable contrast multiplier to break the variance unit ceiling.
+        - beta = Bypassed (implicitly fixed to 1.0) to avoid scaling race conditions.
         """
         B, N, D = x.shape
         num_patches = N - 1
@@ -271,50 +283,69 @@ class Gumbel_Token_Selection_Block_Wrapper(nn.Module):
             n_alpha = target_n_alpha
         self.n_new_tokens = 1 + n_alpha
 
-        # --- Base attention scores from CLS row ---
-        cls_attention  = self.block.attn.class_token_attention
-        base_patch_scores = cls_attention[:, 1:]   # [B, N-1]
-
-        # ==========================================
-        # 1. SIMPLICIAL SCORING (unchanged)
-        # ==========================================
+        # --- Extract Tokens & Native Attention ---
         cls_token    = x[:, 0:1, :]    # [B, 1, D]
         patch_tokens = x[:, 1:, :]     # [B, N-1, D]
 
+        # Extract native a_cls from the block's attention registry
+        cls_attention = self.block.attn.class_token_attention
+        base_patch_scores = cls_attention[:, 1:]  # [B, N-1] (a_cls)
+
+        # ==========================================================
+        # BRANCH 1: SOURCE-AWARE SEMANTIC ANCHOR (Fixed at scale 1.0)
+        # ==========================================================
+        a_cls_norm = F.layer_norm(base_patch_scores, base_patch_scores.shape[-1:])  # [B, N-1]
+
+        # ==========================================================
+        # BRANCH 2: CHANNEL-AWARE GEOMETRIC PROJECTION (Gate * Gamma)
+        # ==========================================================
+        # Step 1: Compute learned projections via W_u and W_tri
         m_cls     = self.w_u(cls_token)       # [B, 1, D]
         patch_tri = self.w_tri(patch_tokens)  # [B, N-1, D]
 
-        y_tri_raw  = torch.norm(m_cls * patch_tri, p=2, dim=-1)   # [B, N-1]
-        y_tri_norm = F.layer_norm(y_tri_raw, y_tri_raw.shape[-1:])
-        y_tri      = y_tri_norm * self.branch_norm_weight + self.branch_norm_bias
+        # Step 2: Hadamard product (element-wise multiply with broadcasting)
+        hadamard_product = m_cls * patch_tri  # [B, N-1, D]
 
-        x_std       = base_patch_scores
-        raw_logits  = (self.beta * x_std) + (torch.sigmoid(self.gate_param) * self.gamma * y_tri)
+        # Step 3: L2 norm across feature dimension
+        y_raw = torch.norm(hadamard_product, p=2, dim=-1)  # [B, N-1]
 
+        # Step 4: LayerNorm to stabilize geometric variance before contrast modulation
+        y_norm = F.layer_norm(y_raw, y_raw.shape[-1:])  # [B, N-1]
+
+        # Step 5: Soft-Gating AND Contrast Expansion (Cooperative Gating)
+        gate_gain = torch.sigmoid(self.gate_param)  # Scalar in (0, 1)
+        
+        # Dual parameter chain: sigmoid(g) * gamma * LN(y)
+        branch_geometric = gate_gain * self.gamma * y_norm  # [B, N-1]
+
+        # ==========================================================
+        # ADDITIVE FUSION (The Regulated Duel)
+        # ==========================================================
+        raw_logits = a_cls_norm + branch_geometric  # [B, N-1]
+
+        # ==========================================================
+        # DIAGNOSTICS: Extract statistics BEFORE curriculum scaling
+        # ==========================================================
+        y_tri_raw_mean = y_raw.mean().item()
+        y_tri_raw_std = y_raw.std().item()
+        gate_sigmoid_val = gate_gain.item()
+        
         # ==========================================
-        # 2. LOGIT SCALING DINAMICO (NEW)
+        # 2. LOGIT SCALING DINAMICO (curriculum, kept)
         # ==========================================
-        # During training, scale logits by a curriculum ramp so the network
-        # starts with near-uniform logits (random selection) and only develops
-        # discriminative power once the backbone has learned useful features.
-        # At eval time, we use full scale (alpha_scale = 1.0).
         if self.training:
             alpha_scale = self._compute_logit_scale()
         else:
             alpha_scale = 1.0
 
-        final_logits = raw_logits * alpha_scale   # [B, N-1]
+        final_logits = raw_logits * alpha_scale  # [B, N-1]
 
         # ==========================================
-        # 3. STABILITY BONUS — apply EMA from PREVIOUS batches (NEW)
+        # 3. STABILITY BONUS — apply EMA from PREVIOUS batches
         # ==========================================
-        # The EMA is updated AFTER selection (below), so here we use the
-        # bonus computed during the previous forward.  This avoids a chicken-
-        # and-egg problem while still reinforcing systematic selections.
         if self.stability_bonus_enabled and self._selection_freq_ema is not None:
             ema = self._selection_freq_ema.to(device=device, dtype=final_logits.dtype)
             if ema.shape[0] == num_patches:
-                # Center the EMA so neutral patches get 0 bonus, not a uniform lift
                 ema_centered = ema - ema.mean()
                 final_logits = final_logits + self.stability_bonus_weight * ema_centered.unsqueeze(0)
 
@@ -322,30 +353,16 @@ class Gumbel_Token_Selection_Block_Wrapper(nn.Module):
         patch_scores_probs = F.softmax(final_logits, dim=-1)   # [B, N-1]
 
         # ==========================================
-        # 4. ENTROPY BOTTLENECK LOSS (NEW — replaces batch entropy maximization)
+        # 4. ENTROPY BOTTLENECK LOSS
         # ==========================================
-        # Loss_ent = entropy_bottleneck_weight * max(0, H_actual - H_target(epoch))
-        #
-        # Semantics:
-        #   • When H_actual > H_target  → distribution is too uniform for this
-        #     stage of training → push it down gently.
-        #   • When H_actual < H_target  → distribution has legitimately sharpened
-        #     → loss is zero, no interference with classification gradient.
-        #
-        # H_target decreases from entropy_target_start to entropy_target_end so
-        # the "allowed" uniformity shrinks progressively with the curriculum.
         if self.entropy_bottleneck_enabled and self.training:
-            # Instance-level entropy, averaged over batch
             H_actual = -(patch_scores_probs * torch.log(patch_scores_probs + 1e-9)).sum(dim=-1).mean()
             H_target_val = self._compute_entropy_target()
-            # max(0, H_actual - H_target): penalise only over-uniformity
             entropy_ceiling_loss = torch.clamp(H_actual - H_target_val, min=0.0)
             self.entropy_reg_loss = self.entropy_bottleneck_weight * entropy_ceiling_loss
-            # Expose scalar for diagnostics
             self._last_H_actual  = H_actual.item()
             self._last_H_target  = H_target_val
         else:
-            # Fallback: keep the old batch-diversity term (or zero when not training)
             p_mean = patch_scores_probs.mean(dim=0)
             batch_entropy = -torch.sum(p_mean * torch.log(p_mean + 1e-9))
             self.entropy_reg_loss = batch_entropy
@@ -353,7 +370,7 @@ class Gumbel_Token_Selection_Block_Wrapper(nn.Module):
             self._last_H_target  = float('nan')
 
         # ==========================================
-        # DIAGNOSTICS PHASE 1 & 2 (extended)
+        # DIAGNOSTICS PHASE (with proper key population)
         # ==========================================
         if hasattr(self, "diagnostic_stats") and self.training:
             tau = self.current_tau
@@ -369,23 +386,26 @@ class Gumbel_Token_Selection_Block_Wrapper(nn.Module):
             self.diagnostic_stats["entropy_target"].append(self._last_H_target)
             self.diagnostic_stats["logit_alpha_scale"].append(alpha_scale)
 
-            # Batch diversity entropy (kept for monitoring even when not used as loss)
             p_mean_diag = patch_scores_probs.mean(dim=0)
             batch_ent_val = -torch.sum(p_mean_diag * torch.log(p_mean_diag + 1e-9))
             self.diagnostic_stats["batch_entropy"].append(batch_ent_val.item())
 
+            # Base attention extraction for telemetry reference
+            cls_attention = self.block.attn.class_token_attention
+            base_patch_scores = cls_attention[:, 1:]
             p_base = base_patch_scores / (base_patch_scores.sum(dim=-1, keepdim=True) + 1e-9)
             ent_base = -torch.sum(p_base * torch.log(p_base + 1e-9), dim=-1).mean()
             self.diagnostic_stats["base_entropy"].append(ent_base.item())
 
-            self.diagnostic_stats["y_tri_raw_mean"].append(y_tri_raw.mean().item())
-            self.diagnostic_stats["y_tri_raw_std"].append(y_tri_raw.std().item())
-            self.diagnostic_stats["y_tri_norm_mean"].append(y_tri_norm.mean().item())
-            self.diagnostic_stats["y_tri_norm_std"].append(y_tri_norm.std().item())
-            self.diagnostic_stats["beta"].append(self.beta.item())
-            self.diagnostic_stats["gamma"].append(self.gamma.item())
-            self.diagnostic_stats["gate_sigmoid"].append(torch.sigmoid(self.gate_param).item())
-            self.diagnostic_stats["interaction_norm_check"].append(y_tri_norm.std().item())
+            # ✓ SPEC COMPLIANCE: Populate diagnostic telemetry keys safely
+            self.diagnostic_stats["y_tri_raw_mean"].append(y_tri_raw_mean)
+            self.diagnostic_stats["y_tri_raw_std"].append(y_tri_raw_std)
+            self.diagnostic_stats["y_tri_norm_mean"].append(y_norm.mean().item())
+            self.diagnostic_stats["y_tri_norm_std"].append(y_norm.std().item())
+            self.diagnostic_stats["gate_sigmoid"].append(gate_sigmoid_val)
+            self.diagnostic_stats["beta"].append(self.beta.item())   # Inactive parameter logged safely
+            self.diagnostic_stats["gamma"].append(self.gamma.item()) # ACTIVE parameter logged dynamically
+            self.diagnostic_stats["interaction_norm_check"].append(y_norm.std().item())
 
             if self._selection_freq_ema is not None:
                 ema_buf = self._selection_freq_ema
@@ -417,10 +437,8 @@ class Gumbel_Token_Selection_Block_Wrapper(nn.Module):
         )
 
         # ==========================================
-        # 6. UPDATE STABILITY EMA (NEW)
+        # 6. UPDATE STABILITY EMA
         # ==========================================
-        # Must happen AFTER selection so the EMA reflects actual selections.
-        # We build a hard binary mask [B, N-1] from indices_sel.
         if self.stability_bonus_enabled and self.training:
             with torch.no_grad():
                 relative_sel = indices_sel[:, 1:] - 1              # [B, n_alpha] 0-based
@@ -439,30 +457,16 @@ class Gumbel_Token_Selection_Block_Wrapper(nn.Module):
         # ==========================================
         # 7. BUILD last_adc_scores — Semantic Waterfilling Scores
         # ==========================================
-        # FIX: Three architectural defects corrected:
-        #
-        # DEFECT #1 (was): patch_scores_probs = softmax(logits) over ALL 196 patches
-        #   → each value ≈ 1/196 ≈ 0.005, near-uniform, no dynamic range.
-        #   FIX: Re-softmax over ONLY the selected ~20 tokens → p ≈ 0.02-0.15.
-        #
-        # DEFECT #2 (was): cls_dummy = 1.0 while patches ≈ 0.005 → 200:1 mismatch.
-        #   FIX: CLS = max(selected_scores) + small margin, same scale as patches.
-        #
-        # DEFECT #3 (was): Softmax Jacobian over 196 elements ≈ 0.005 → gradients
-        #   from channel back to score head were ~200× weaker than CE gradient.
-        #   FIX: Softmax over ~20 elements → Jacobian ≈ 0.05, 10× stronger signal.
-        #
         selected_patch_indices = indices_sel[:, 1:] - 1
         selected_logits = torch.gather(final_logits, 1, selected_patch_indices)  # [B, n_alpha]
         selected_scores = F.softmax(selected_logits, dim=-1)                     # [B, n_alpha]
-        # CLS: highest importance but on the same scale as patches
         cls_score = selected_scores.max(dim=1, keepdim=True).values + 0.01       # [B, 1]
         self.last_adc_scores  = torch.cat([cls_score, selected_scores], dim=1)   # [B, 1+n_alpha]
         self.last_indices_sel = indices_sel
         self.last_original_N  = N
 
         return tokens_sel
-
+    
     # ------------------------------------------------------------------
     # forward (unchanged)
     # ------------------------------------------------------------------

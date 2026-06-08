@@ -56,3 +56,8 @@ class Identity(nn.Module):
     def forward(self, input: torch.Tensor):
         return input
 
+class IdentityWrapper(nn.Module):
+    def __init__(self, input_dim=None, config=None, *args, **kwargs):
+        super().__init__()
+    def forward(self, x: torch.Tensor):
+        return x

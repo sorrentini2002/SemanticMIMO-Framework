@@ -718,10 +718,13 @@ def main(cfg):
             has_power_alloc = power_alloc.enabled if hasattr(power_alloc, 'enabled') else False
         
         # Determine communication variant
-        if 'dct' in comm_name:
-            comm_variant = 'DCT'
-        elif 'svd' in comm_name:
-            comm_variant = 'ISW'
+        if 'dct' in comm_name or 'svd' in comm_name:
+            if not has_mode_alloc and not has_power_alloc:
+                comm_variant = 'Base'
+            elif 'dct' in comm_name:
+                comm_variant = 'DCT'
+            else:
+                comm_variant = 'ISW'
         elif 'dct' in comm_name or 'isw' in comm_name:
             # Has dct/isw but no mode/power allocation → Base
             if not has_mode_alloc and not has_power_alloc:
@@ -774,7 +777,19 @@ def main(cfg):
         
         # Build hierarchical path matching results directory structure
         # Special handling for baseline: save at seed level for easy plotting
-        if method_type.lower() == "baseline":
+
+        # Special-case: if the channel has been replaced with an IdentityWrapper
+        # (i.e., no channel active even at eval), treat the run as a Baseline
+        # and save at seed level under 'Baseline'. This covers overrides like
+        # `communication.channel._target_=comm.communication.IdentityWrapper`.
+        ch_target = None
+        try:
+            if hasattr(cfg.communication, 'channel') and hasattr(cfg.communication.channel, '_target_'):
+                ch_target = str(cfg.communication.channel._target_)
+        except Exception:
+            ch_target = None
+
+        if ch_target and 'IdentityWrapper' in ch_target:
             hydra_output_dir = os.path.join(
                 results_path,
                 dataset_name,
@@ -782,18 +797,39 @@ def main(cfg):
                 'Baseline'
             )
         else:
-            # Structure: {method_type}/compression_{value}/{comm_variant}
-            # This matches the actual directory layout where variants are under compression
-            hydra_output_dir = os.path.join(
-                results_path,
-                dataset_name,
-                f'seed_{seed}',
-                f'split_{split_index}',
-                channel_type,
-                method_type,
-                f'compression_{compression_val}',
-                comm_variant
-            )
+            if method_type.lower() == "baseline":
+                hydra_output_dir = os.path.join(
+                    results_path,
+                    dataset_name,
+                    f'seed_{seed}',
+                    'Baseline'
+                )
+            else:
+                # If the communication variant is the Base MIMO (no mode/power alloc),
+                # save under the method/compression path without the extra comm_variant.
+                if comm_variant == 'Base' and channel_type == 'MIMO':
+                    hydra_output_dir = os.path.join(
+                        results_path,
+                        dataset_name,
+                        f'seed_{seed}',
+                        f'split_{split_index}',
+                        channel_type,
+                        method_type,
+                        f'compression_{compression_val}'
+                    )
+                else:
+                    # Structure: {method_type}/compression_{value}/{comm_variant}
+                    # This matches the actual directory layout where variants are under compression
+                    hydra_output_dir = os.path.join(
+                        results_path,
+                        dataset_name,
+                        f'seed_{seed}',
+                        f'split_{split_index}',
+                        channel_type,
+                        method_type,
+                        f'compression_{compression_val}',
+                        comm_variant
+                    )
         
         if custom_title and method_type.lower() != "baseline":
             hydra_output_dir = os.path.join(hydra_output_dir, custom_title)
