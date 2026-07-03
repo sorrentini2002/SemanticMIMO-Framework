@@ -1,0 +1,12 @@
+{
+    "best_epoch": 12,
+    "best_train_accuracy": 0.8994591346153846,
+    "best_train_loss": 0.3208728614143836,
+    "best_communication_cost": 599040.0,
+    "top_imp_frac": 0.0,
+    "tokens_sent": 0,
+    "symbols_sent": 0,
+    "symbol_rate": 0.0,
+    "best_val_accuracy": 0.8149723101265823,
+    "best_val_loss": 0.6873555085327052
+}

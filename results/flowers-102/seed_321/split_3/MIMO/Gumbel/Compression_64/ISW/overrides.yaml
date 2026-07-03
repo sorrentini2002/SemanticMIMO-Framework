@@ -1,0 +1,12 @@
+- method=gumbel
+- communication=baseline_mimo_svd
+- dataset=flowers_102
+- model=deit_tiny_patch16_224
+- optimizer=adam
+- hyperparameters.experiment_name=ISW_64
+- hyperparameters.split_index=3
+- hyperparameters.seeds=321
+- dataset.train.download=True
+- dataset.test.download=True
+- ++core.dataset_path=/kaggle/working/data
+- method.parameters.desired_compression=0.3214

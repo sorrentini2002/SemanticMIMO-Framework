@@ -1,0 +1,17 @@
+- method=gumbel
+- communication=baseline_mimo_svd
+- dataset=cifar_100
+- model=deit_tiny_patch16_224
+- optimizer=adam
+- hyperparameters.experiment_name=Ablation_ChannelOnly_NoCompression
+- hyperparameters.split_index=3
+- hyperparameters.seeds=42
+- dataset.train.download=True
+- dataset.test.download=True
+- ++core.dataset_path=/kaggle/working/data
+- method.parameters.compression_enabled=false
+- method.parameters.desired_compression=1.0
+- method.parameters.semantic_waterfilling=false
+- communication.comm.bottleneck.enabled=false
+- communication.comm.channel.enabled=true
+- communication.comm.channel.mode_alloc.enabled=false
