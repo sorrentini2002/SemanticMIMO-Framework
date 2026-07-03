@@ -5,7 +5,7 @@ from typing import Sequence
 
 
 # Classic analogic channel with gaussian noise 
-class Gaussian_Noise_Analogic_Channel(nn.Module):
+class AnalogGaussianNoiseChannel(nn.Module):
     def __init__(self,
                   snr_range:float):
         super().__init__()

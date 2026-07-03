@@ -1,5 +1,7 @@
 # Libraries
 import os
+import re
+import random
 import hydra 
 import torch 
 import json 
@@ -9,6 +11,7 @@ import matplotlib
 matplotlib.use('Agg')          # non-interactive backend (no display needed)
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
+import torch.nn as nn
 
 # Custom functions 
 from omegaconf import OmegaConf
@@ -31,8 +34,8 @@ OmegaConf.register_new_resolver("flatten_params", flatten_params)
 # TRAINING PHASE
 # ============================================================
 
-def training_phase(model, train_data_loader, loss, optimizer, device, plot,
-                   current_epoch=1, num_epochs=1):
+def train_one_epoch(model, train_data_loader, loss, optimizer, device, plot,
+                    current_epoch=1, num_epochs=1):
 
     if plot:
         print("\nTraining phase: ")
@@ -43,7 +46,6 @@ def training_phase(model, train_data_loader, loss, optimizer, device, plot,
 
     model.train()
     iterations = 0
-    import random
 
     # --- SNR Range Decision (Accelerated Sampling) ---
     late_phase_start = max(1, num_epochs - num_epochs // 5)
@@ -132,7 +134,7 @@ def training_phase(model, train_data_loader, loss, optimizer, device, plot,
 # VALIDATION PHASE  (unchanged)
 # ============================================================
 
-def validation_phase(model, val_data_loader, loss, device, plot):
+def evaluate_one_epoch(model, val_data_loader, loss, device, plot):
     if plot:
         print("Validation phase: ")
 
@@ -187,16 +189,9 @@ def save_visualization(model, val_loader, device, hydra_output_dir,
       - Column 1  – Original Image (Clean)
       - Column 2  – Original + GREEN overlay of Gumbel-selected patches
     """
-    import random
-    import numpy as np
-    import os
-    import torch
-    import matplotlib.pyplot as plt
-    import matplotlib.patches as mpatches
-    
-    GRID_SIZE = 14                       # 224 / 16 = 14 patches per side
-    IMG_SIZE  = 224
-    PATCH_PX  = IMG_SIZE // GRID_SIZE    # 16 px per patch
+    PATCH_GRID_COUNT = 14                       # 224 / 16 = 14 patches per side
+    IMAGE_RESOLUTION_PX  = 224
+    PATCH_SIZE_PX  = IMAGE_RESOLUTION_PX // PATCH_GRID_COUNT    # 16 px per patch
 
     # --- Collect randomly n_samples images ---------------------------
     dataset = val_loader.dataset
@@ -228,15 +223,15 @@ def save_visualization(model, val_loader, device, hydra_output_dir,
 
     # --- Helper: build RGBA overlay from a set of patch indices -----
     def _build_overlay(patch_ids_1d, color_rgb, alpha=0.4):
-        overlay = np.zeros((IMG_SIZE, IMG_SIZE, 4), dtype=np.float32)
+        overlay = np.zeros((IMAGE_RESOLUTION_PX, IMAGE_RESOLUTION_PX, 4), dtype=np.float32)
         for pid in patch_ids_1d:
             pid = int(pid)
-            if pid < 0 or pid >= GRID_SIZE * GRID_SIZE:
+            if pid < 0 or pid >= PATCH_GRID_COUNT * PATCH_GRID_COUNT:
                 continue
-            row = pid // GRID_SIZE
-            col = pid % GRID_SIZE
-            y0, y1 = row * PATCH_PX, (row + 1) * PATCH_PX
-            x0, x1 = col * PATCH_PX, (col + 1) * PATCH_PX
+            row = pid // PATCH_GRID_COUNT
+            col = pid % PATCH_GRID_COUNT
+            y0, y1 = row * PATCH_SIZE_PX, (row + 1) * PATCH_SIZE_PX
+            x0, x1 = col * PATCH_SIZE_PX, (col + 1) * PATCH_SIZE_PX
             overlay[y0:y1, x0:x1, :3] = color_rgb
             overlay[y0:y1, x0:x1, 3]  = alpha
         return overlay
@@ -324,7 +319,7 @@ def training_schedule(model, train_data_loader, val_data_loader,
             # CURRICULUM: notify the compressor of current epoch progress
             # ================================================================
             # This drives _compute_logit_scale() and _compute_entropy_target()
-            # inside Gumbel_Token_Selection_Block_Wrapper.
+            # inside GumbelTokenSelectorBlockWrapper.
             if hasattr(model, 'compressor_module') and \
                hasattr(model.compressor_module, 'register_epoch'):
                 model.compressor_module.register_epoch(epoch, num_epochs)
@@ -336,7 +331,7 @@ def training_schedule(model, train_data_loader, val_data_loader,
                           f"logit_alpha={alpha_now:.3f} | H_target={h_target:.3f}")
 
             # Training phase
-            avg_train_loss, avg_train_accuracy, train_stats = training_phase(
+            avg_train_loss, avg_train_accuracy, train_stats = train_one_epoch(
                 model, train_data_loader, loss, optimizer, device, plot,
                 current_epoch=epoch, num_epochs=num_epochs
             )
@@ -379,7 +374,7 @@ def training_schedule(model, train_data_loader, val_data_loader,
                 original_snr = cfg.communication.comm.channel.get('snr_db', 20.0)
                 for snr in snr_sweep:
                     model.channel.reconfigure({'channel': {'snr_db': snr}})
-                    v_loss, v_acc, v_stats = validation_phase(model, val_data_loader, loss, device, plot=False)
+                    v_loss, v_acc, v_stats = evaluate_one_epoch(model, val_data_loader, loss, device, plot=False)
                     val_loss_dict[str(snr)] = v_loss
                     val_acc_dict[str(snr)]  = v_acc
                     val_stats_dict[str(snr)] = v_stats
@@ -393,7 +388,7 @@ def training_schedule(model, train_data_loader, val_data_loader,
                 val_losses.append(val_loss_dict)
                 val_accuracies.append(val_acc_dict)
             else:
-                avg_val_loss, avg_val_accuracy, repr_v_stats = validation_phase(
+                avg_val_loss, avg_val_accuracy, repr_v_stats = evaluate_one_epoch(
                     model, val_data_loader, loss, device, plot
                 )
                 val_losses.append(avg_val_loss)
@@ -526,9 +521,268 @@ def training_schedule(model, train_data_loader, val_data_loader,
                 json.dump(results, f, indent=4)
 
 
-# ============================================================
-# MAIN
-# ============================================================
+def _build_param_groups(model, cfg):
+    """
+    Construct parameter groups for optimization with specific learning rates and weight decays.
+    """
+    base_lr = cfg.optimizer.lr
+    base_wd = cfg.optimizer.weight_decay
+
+    encoder_2d    = []
+    decoder_2d    = []
+    score_head_2d = []   # simplicial Gumbel params (2-D tensors → apply WD)
+
+    encoder_1d    = []
+    decoder_1d    = []
+    score_head_1d = []   # simplicial biases / norms (1-D → no WD)
+
+    split_idx = cfg.hyperparameters.split_index
+
+    SCORE_HEAD_NAMES = [
+        'compressor_module.w_u',
+        'compressor_module.w_tri',
+        'compressor_module.gamma',
+        'compressor_module.beta',
+        'compressor_module.gate',
+        'compressor_module.branch_norm',
+    ]
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+
+        # --- Score-head detection (Gumbel simplicial branch) ---
+        is_score_head = any(tag in name for tag in SCORE_HEAD_NAMES)
+
+        # --- Encoder detection ---
+        is_encoder = False
+        if not is_score_head and 'head' not in name:
+            if any(x in name for x in ['patch_embed', 'cls_token', 'pos_embed']):
+                is_encoder = True
+            elif 'blocks.' in name:
+                match = re.search(r'blocks\.(\d+)', name)
+                if match and int(match.group(1)) < split_idx:
+                    is_encoder = True
+
+        is_decoder_or_head = not is_score_head and not is_encoder
+
+        # --- 1-D / norm detection (no weight decay) ---
+        is_1d_or_norm = param.ndim <= 1 or 'norm' in name or 'bias' in name
+
+        if is_score_head:
+            if is_1d_or_norm:
+                score_head_1d.append(param)
+            else:
+                score_head_2d.append(param)
+        elif is_encoder:
+            if is_1d_or_norm:
+                encoder_1d.append(param)
+            else:
+                encoder_2d.append(param)
+        else:  # decoder / head
+            if is_1d_or_norm:
+                decoder_1d.append(param)
+            else:
+                decoder_2d.append(param)
+
+    param_groups = [
+        # ENCODER
+        {'params': encoder_2d,    'lr': base_lr * 0.1, 'weight_decay': base_wd},
+        {'params': encoder_1d,    'lr': base_lr * 0.1, 'weight_decay': 0.0},
+        # DECODER & HEAD
+        {'params': decoder_2d,    'lr': base_lr,       'weight_decay': base_wd},
+        {'params': decoder_1d,    'lr': base_lr,       'weight_decay': 0.0},
+        # SCORE HEAD (Gumbel simplicial) — moderate WD to cap logit saturation
+        {'params': score_head_2d, 'lr': base_lr * 5.0, 'weight_decay': 1e-3},
+        {'params': score_head_1d, 'lr': base_lr * 5.0, 'weight_decay': 0.0},
+    ]
+    return param_groups
+
+
+def _build_output_dir(cfg, seed: int, model: nn.Module) -> str:
+    """
+    Construct the hierarchical output directory path according to the configuration and seed.
+    """
+    results_path = cfg.core.get('results_path', './results')
+    dataset_name = cfg.dataset.name
+    split_index = cfg.hyperparameters.split_index
+    
+    # Extract channel type from communication.name
+    comm_name = cfg.communication.name.lower()
+    if 'mimo' in comm_name:
+        channel_type = 'MIMO'
+    elif comm_name == 'clean':
+        channel_type = 'None'
+    else:
+        channel_type = 'AWGN'
+    
+    # Extract method type from method.name
+    method_name = cfg.method.name.lower()
+    if 'gumbel' in method_name:
+        method_type = 'Gumbel'
+    elif 'random' in method_name:
+        method_type = 'Random'
+    else:
+        method_type = cfg.method.name
+    
+    # ================================================================
+    # COMMUNICATION VARIANT CLASSIFICATION
+    # Classifica la variante di comunicazione basata su config
+    # ================================================================
+    comm_name = cfg.communication.name.lower()
+    
+    # Check for mode and power allocation flags
+    has_mode_alloc = False
+    has_power_alloc = False
+    
+    if hasattr(cfg.communication.comm, 'channel') and hasattr(cfg.communication.comm.channel, 'mode_alloc'):
+        mode_alloc = cfg.communication.comm.channel.mode_alloc
+        has_mode_alloc = mode_alloc.enabled if hasattr(mode_alloc, 'enabled') else False
+    
+    if hasattr(cfg.communication.comm, 'channel') and hasattr(cfg.communication.comm.channel, 'power_alloc'):
+        power_alloc = cfg.communication.comm.channel.power_alloc
+        has_power_alloc = power_alloc.enabled if hasattr(power_alloc, 'enabled') else False
+    
+    # Determine communication variant
+    if 'dct' in comm_name or 'svd' in comm_name:
+        if not has_mode_alloc and not has_power_alloc:
+            comm_variant = 'Base'
+        elif 'dct' in comm_name:
+            comm_variant = 'DCT'
+        else:
+            comm_variant = 'ISW'
+    elif 'dct' in comm_name or 'isw' in comm_name:
+        # Has dct/isw but no mode/power allocation → Base
+        if not has_mode_alloc and not has_power_alloc:
+            comm_variant = 'Base'
+        else:
+            comm_variant = 'ISW' if 'isw' in comm_name else 'DCT'
+    else:
+        # Generic fallback: use communication name or "Other"
+        comm_variant = comm_name.replace('baseline_mimo_', '').upper() if 'baseline' in comm_name else 'Other'
+    
+    # ================================================================
+    # AUTOMATIC TOKEN TRANSMISSION CALCULATION
+    # Tokens transmitted = input_dim (total tokens) × desired_compression (ratio)
+    # Example: 192 × 0.1 = 19.2 ≈ 19 tokens transmitted
+    # ================================================================
+    
+    # Get total tokens from config (communication.channel.input_dim)
+    total_tokens = cfg.communication.channel.input_dim if hasattr(cfg.communication.channel, 'input_dim') else 192
+    
+    # Get compression ratio from config (method.parameters.desired_compression)
+    compression_ratio = None
+    if hasattr(cfg, 'method') and isinstance(cfg.method, dict) is False:
+        # OmegaConf dict-like - use get
+        compression_ratio = cfg.method.parameters.get('desired_compression') if cfg.method.parameters is not None else None
+        if compression_ratio is None:
+            compression_ratio = cfg.method.parameters.get('token_compression') if cfg.method.parameters is not None else None
+    else:
+        # Generic fallback for plain dict-like
+        compression_ratio = cfg.get('desired_compression', None)
+
+    if compression_ratio is None:
+        compression_ratio = getattr(model, 'compression_ratio', None)
+
+    # Calculate transmitted tokens: int(total_tokens × compression_ratio)
+    try:
+        if isinstance(compression_ratio, (int, float)) and compression_ratio > 0:
+            # Assume compression_ratio is already a decimal (e.g., 0.1 = 10%)
+            transmitted_tokens = int(round(total_tokens * float(compression_ratio)))
+        else:
+            # Fallback: treat as already being the transmitted token count
+            transmitted_tokens = int(float(compression_ratio)) if compression_ratio is not None else total_tokens
+    except Exception:
+        transmitted_tokens = total_tokens
+
+    compression_val = transmitted_tokens
+    
+    # Optional custom title from experiment_name (only if not 'test')
+    experiment_name = cfg.hyperparameters.get('experiment_name', 'test')
+    custom_title = experiment_name if experiment_name != 'test' else ''
+    
+    # Build hierarchical path matching results directory structure
+    # Special handling for baseline: save at seed level for easy plotting
+
+    # Special-case: if the channel has been replaced with an IdentityWrapper
+    # (i.e., no channel active even at eval), treat the run as a Baseline
+    # and save at seed level under 'Baseline'. This covers overrides like
+    # `communication.channel._target_=comm.communication.IdentityWrapper`.
+    ch_target = None
+    try:
+        if hasattr(cfg.communication, 'channel') and hasattr(cfg.communication.channel, '_target_'):
+            ch_target = str(cfg.communication.channel._target_)
+    except Exception:
+        ch_target = None
+
+    if ch_target and 'IdentityWrapper' in ch_target:
+        hydra_output_dir = os.path.join(
+            results_path,
+            dataset_name,
+            f'seed_{seed}',
+            'Baseline'
+        )
+    else:
+        if method_type.lower() == "baseline":
+            hydra_output_dir = os.path.join(
+                results_path,
+                dataset_name,
+                f'seed_{seed}',
+                'Baseline'
+            )
+        elif method_type.lower() == "random":
+            # Per il metodo Random saltiamo le varianti (ISW, Base, ecc.)
+            # e usiamo la C maiuscola per "Compression" come da te richiesto
+            hydra_output_dir = os.path.join(
+                results_path,
+                dataset_name,
+                f'seed_{seed}',
+                f'split_{split_index}',
+                channel_type,
+                method_type,
+                f'Compression_{compression_val}'
+            )
+        else:
+            if comm_variant == 'Base' and channel_type == 'MIMO':
+                comp_str = str(int(compression_val)) if compression_val == int(compression_val) else str(compression_val)
+                
+                hydra_output_dir = os.path.join(
+                    results_path,
+                    dataset_name,
+                    f'seed_{seed}',
+                    f'split_{split_index}',
+                    channel_type,       
+                    'base',             
+                    f'compression_1'
+                )
+            else:
+                # Structure: {method_type}/compression_{value}/{comm_variant}
+                # This matches the actual directory layout where variants are under compression
+                hydra_output_dir = os.path.join(
+                    results_path,
+                    dataset_name,
+                    f'seed_{seed}',
+                    f'split_{split_index}',
+                    channel_type,
+                    method_type,
+                    f'compression_{compression_val}',
+                    comm_variant
+                )
+    
+    if custom_title and method_type.lower() != "baseline":
+        hydra_output_dir = os.path.join(hydra_output_dir, custom_title)
+    
+    # Handle duplicate runs by appending counter
+    base_dir = hydra_output_dir
+    counter = 1
+    while os.path.exists(os.path.join(hydra_output_dir, "final_training_results.json")) or \
+          os.path.exists(os.path.join(hydra_output_dir, "training_results.json")):
+        hydra_output_dir = f"{base_dir}_{counter}"
+        counter += 1
+
+    os.makedirs(hydra_output_dir, exist_ok=True)
+    return hydra_output_dir
+
 
 @hydra.main(config_path="configs", version_base='1.2', config_name="default")
 def main(cfg):
@@ -585,80 +839,9 @@ def main(cfg):
         # A non-zero weight_decay prevents the logit norms from drifting to
         # saturation, naturally capping std at a healthy target of ~2.0.
         # ======================================================================
-        base_lr = cfg.optimizer.lr
-        base_wd = cfg.optimizer.weight_decay
-
-        encoder_2d    = []
-        decoder_2d    = []
-        score_head_2d = []   # simplicial Gumbel params (2-D tensors → apply WD)
-
-        encoder_1d    = []
-        decoder_1d    = []
-        score_head_1d = []   # simplicial biases / norms (1-D → no WD)
-
-        split_idx = cfg.hyperparameters.split_index
-        import re
-
-        SCORE_HEAD_NAMES = [
-            'compressor_module.w_u',
-            'compressor_module.w_tri',
-            'compressor_module.gamma',
-            'compressor_module.beta',
-            'compressor_module.gate',
-            'compressor_module.branch_norm',
-        ]
-
-        for name, param in model.named_parameters():
-            if not param.requires_grad:
-                continue
-
-            # --- Score-head detection (Gumbel simplicial branch) ---
-            is_score_head = any(tag in name for tag in SCORE_HEAD_NAMES)
-
-            # --- Encoder detection ---
-            is_encoder = False
-            if not is_score_head and 'head' not in name:
-                if any(x in name for x in ['patch_embed', 'cls_token', 'pos_embed']):
-                    is_encoder = True
-                elif 'blocks.' in name:
-                    match = re.search(r'blocks\.(\d+)', name)
-                    if match and int(match.group(1)) < split_idx:
-                        is_encoder = True
-
-            is_decoder_or_head = not is_score_head and not is_encoder
-
-            # --- 1-D / norm detection (no weight decay) ---
-            is_1d_or_norm = param.ndim <= 1 or 'norm' in name or 'bias' in name
-
-            if is_score_head:
-                if is_1d_or_norm:
-                    score_head_1d.append(param)
-                else:
-                    score_head_2d.append(param)
-            elif is_encoder:
-                if is_1d_or_norm:
-                    encoder_1d.append(param)
-                else:
-                    encoder_2d.append(param)
-            else:  # decoder / head
-                if is_1d_or_norm:
-                    decoder_1d.append(param)
-                else:
-                    decoder_2d.append(param)
-
-        param_groups = [
-            # ENCODER
-            {'params': encoder_2d,    'lr': base_lr * 0.1, 'weight_decay': base_wd},
-            {'params': encoder_1d,    'lr': base_lr * 0.1, 'weight_decay': 0.0},
-            # DECODER & HEAD
-            {'params': decoder_2d,    'lr': base_lr,       'weight_decay': base_wd},
-            {'params': decoder_1d,    'lr': base_lr,       'weight_decay': 0.0},
-            # SCORE HEAD (Gumbel simplicial) — moderate WD to cap logit saturation
-            {'params': score_head_2d, 'lr': base_lr * 5.0, 'weight_decay': 1e-3},
-            {'params': score_head_1d, 'lr': base_lr * 5.0, 'weight_decay': 0.0},
-        ]
-
+        param_groups = _build_param_groups(model, cfg)
         optimizer = torch.optim.AdamW(param_groups, eps=cfg.optimizer.eps)
+        score_head_2d_params = param_groups[4]['params']
 
         print(
             f"\n\nTraining seed {seed}:"
@@ -666,7 +849,7 @@ def main(cfg):
             f"\n  dataset={cfg.dataset.name}"
             f"\n  method={cfg.method.name}"
             f"\n  compression={model.compression_ratio}"
-            f"\n  score_head_2d params: {sum(p.numel() for p in score_head_2d)}"
+            f"\n  score_head_2d params: {sum(p.numel() for p in score_head_2d_params)}"
             f"\n  logit_scale_start={cfg.method.parameters.get('logit_scale_start', 0.1)}"
             f"  → logit_scale_end={cfg.method.parameters.get('logit_scale_end', 1.0)}"
             f"\n  entropy_target: {cfg.method.parameters.get('entropy_target_start', 5.2)}"
@@ -677,172 +860,7 @@ def main(cfg):
         # NEW: Hierarchical directory structure
         # Structure: results/{dataset}/seed_{seed}/split_{split}/{channel_type}/{method_type}/compression_{compression}/{optional_title}
         # ================================================================
-        results_path = cfg.core.get('results_path', './results')
-        dataset_name = cfg.dataset.name
-        split_index = cfg.hyperparameters.split_index
-        
-        # Extract channel type from communication.name
-        comm_name = cfg.communication.name.lower()
-        if 'mimo' in comm_name:
-            channel_type = 'MIMO'
-        elif comm_name == 'clean':
-            channel_type = 'None'
-        else:
-            channel_type = 'AWGN'
-        
-        # Extract method type from method.name
-        method_name = cfg.method.name.lower()
-        if 'gumbel' in method_name:
-            method_type = 'Gumbel'
-        elif 'random' in method_name:
-            method_type = 'Random'
-        else:
-            method_type = cfg.method.name
-        
-        # ================================================================
-        # COMMUNICATION VARIANT CLASSIFICATION
-        # Classifica la variante di comunicazione basata su config
-        # ================================================================
-        comm_name = cfg.communication.name.lower()
-        
-        # Check for mode and power allocation flags
-        has_mode_alloc = False
-        has_power_alloc = False
-        
-        if hasattr(cfg.communication.comm, 'channel') and hasattr(cfg.communication.comm.channel, 'mode_alloc'):
-            mode_alloc = cfg.communication.comm.channel.mode_alloc
-            has_mode_alloc = mode_alloc.enabled if hasattr(mode_alloc, 'enabled') else False
-        
-        if hasattr(cfg.communication.comm, 'channel') and hasattr(cfg.communication.comm.channel, 'power_alloc'):
-            power_alloc = cfg.communication.comm.channel.power_alloc
-            has_power_alloc = power_alloc.enabled if hasattr(power_alloc, 'enabled') else False
-        
-        # Determine communication variant
-        if 'dct' in comm_name or 'svd' in comm_name:
-            if not has_mode_alloc and not has_power_alloc:
-                comm_variant = 'Base'
-            elif 'dct' in comm_name:
-                comm_variant = 'DCT'
-            else:
-                comm_variant = 'ISW'
-        elif 'dct' in comm_name or 'isw' in comm_name:
-            # Has dct/isw but no mode/power allocation → Base
-            if not has_mode_alloc and not has_power_alloc:
-                comm_variant = 'Base'
-            else:
-                comm_variant = 'ISW' if 'isw' in comm_name else 'DCT'
-        else:
-            # Generic fallback: use communication name or "Other"
-            comm_variant = comm_name.replace('baseline_mimo_', '').upper() if 'baseline' in comm_name else 'Other'
-        
-        # ================================================================
-        # AUTOMATIC TOKEN TRANSMISSION CALCULATION
-        # Tokens transmitted = input_dim (total tokens) × desired_compression (ratio)
-        # Example: 192 × 0.1 = 19.2 ≈ 19 tokens transmitted
-        # ================================================================
-        
-        # Get total tokens from config (communication.channel.input_dim)
-        total_tokens = cfg.communication.channel.input_dim if hasattr(cfg.communication.channel, 'input_dim') else 192
-        
-        # Get compression ratio from config (method.parameters.desired_compression)
-        compression_ratio = None
-        if hasattr(cfg, 'method') and isinstance(cfg.method, dict) is False:
-            # OmegaConf dict-like - use get
-            compression_ratio = cfg.method.parameters.get('desired_compression') if cfg.method.parameters is not None else None
-            if compression_ratio is None:
-                compression_ratio = cfg.method.parameters.get('token_compression') if cfg.method.parameters is not None else None
-        else:
-            # Generic fallback for plain dict-like
-            compression_ratio = cfg.get('desired_compression', None)
-
-        if compression_ratio is None:
-            compression_ratio = getattr(model, 'compression_ratio', None)
-
-        # Calculate transmitted tokens: int(total_tokens × compression_ratio)
-        try:
-            if isinstance(compression_ratio, (int, float)) and compression_ratio > 0:
-                # Assume compression_ratio is already a decimal (e.g., 0.1 = 10%)
-                transmitted_tokens = int(round(total_tokens * float(compression_ratio)))
-            else:
-                # Fallback: treat as already being the transmitted token count
-                transmitted_tokens = int(float(compression_ratio)) if compression_ratio is not None else total_tokens
-        except Exception:
-            transmitted_tokens = total_tokens
-
-        compression_val = transmitted_tokens
-        
-        # Optional custom title from experiment_name (only if not 'test')
-        experiment_name = cfg.hyperparameters.get('experiment_name', 'test')
-        custom_title = experiment_name if experiment_name != 'test' else ''
-        
-        # Build hierarchical path matching results directory structure
-        # Special handling for baseline: save at seed level for easy plotting
-
-        # Special-case: if the channel has been replaced with an IdentityWrapper
-        # (i.e., no channel active even at eval), treat the run as a Baseline
-        # and save at seed level under 'Baseline'. This covers overrides like
-        # `communication.channel._target_=comm.communication.IdentityWrapper`.
-        ch_target = None
-        try:
-            if hasattr(cfg.communication, 'channel') and hasattr(cfg.communication.channel, '_target_'):
-                ch_target = str(cfg.communication.channel._target_)
-        except Exception:
-            ch_target = None
-
-        if ch_target and 'IdentityWrapper' in ch_target:
-            hydra_output_dir = os.path.join(
-                results_path,
-                dataset_name,
-                f'seed_{seed}',
-                'Baseline'
-            )
-        else:
-            if method_type.lower() == "baseline":
-                hydra_output_dir = os.path.join(
-                    results_path,
-                    dataset_name,
-                    f'seed_{seed}',
-                    'Baseline'
-                )
-            else:
-                # If the communication variant is the Base MIMO (no mode/power alloc),
-                # save under the method/compression path without the extra comm_variant.
-                if comm_variant == 'Base' and channel_type == 'MIMO':
-                    hydra_output_dir = os.path.join(
-                        results_path,
-                        dataset_name,
-                        f'seed_{seed}',
-                        f'split_{split_index}',
-                        channel_type,
-                        method_type,
-                        f'compression_{compression_val}'
-                    )
-                else:
-                    # Structure: {method_type}/compression_{value}/{comm_variant}
-                    # This matches the actual directory layout where variants are under compression
-                    hydra_output_dir = os.path.join(
-                        results_path,
-                        dataset_name,
-                        f'seed_{seed}',
-                        f'split_{split_index}',
-                        channel_type,
-                        method_type,
-                        f'compression_{compression_val}',
-                        comm_variant
-                    )
-        
-        if custom_title and method_type.lower() != "baseline":
-            hydra_output_dir = os.path.join(hydra_output_dir, custom_title)
-        
-        # Handle duplicate runs by appending counter
-        base_dir = hydra_output_dir
-        counter = 1
-        while os.path.exists(os.path.join(hydra_output_dir, "final_training_results.json")) or \
-              os.path.exists(os.path.join(hydra_output_dir, "training_results.json")):
-            hydra_output_dir = f"{base_dir}_{counter}"
-            counter += 1
-
-        os.makedirs(hydra_output_dir, exist_ok=True)
+        hydra_output_dir = _build_output_dir(cfg, seed, model)
 
         training_schedule(
             model, train_dataloader, val_dataloader,

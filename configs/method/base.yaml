@@ -1,4 +1,0 @@
-model:
-  _target_: methods.base.model
-name : base
-parameters: null

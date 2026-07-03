@@ -26,6 +26,16 @@ def _to_plain_dict(cfg):
         return type(cfg)(_to_plain_dict(v) for v in cfg)
     return cfg
 
+
+def _snr_adaptive_alpha(alpha_base: float, snr_db: float | None, threshold: float, slope: float) -> float:
+    """Compute SNR-adaptive alpha via sigmoid tempering."""
+    if snr_db is not None:
+        _arg = -slope * (snr_db - threshold)
+        _sig = float(torch.tensor([_arg]).sigmoid().item())
+        return alpha_base * _sig
+    return alpha_base
+
+
 class CommModule(nn.Module):
     """
     Communication Module that orchestrates:
@@ -162,12 +172,7 @@ class CommModule(nn.Module):
         # ── SNR-ADAPTIVE ALPHA TEMPERING ──────────────────────────
         snr_threshold = float(cfg.get("snr_threshold", 5.0))
         snr_slope     = float(cfg.get("snr_slope", 0.3))
-        if current_snr_db is not None:
-            _arg = -snr_slope * (current_snr_db - snr_threshold)
-            _sig = float(torch.tensor([_arg]).sigmoid().item())
-            alpha = alpha_base * _sig
-        else:
-            alpha = alpha_base
+        alpha = _snr_adaptive_alpha(alpha_base, current_snr_db, snr_threshold, snr_slope)
         # ─────────────────────────────────────────────────────────
 
         stats = {
@@ -694,12 +699,7 @@ class CommModule(nn.Module):
             # We temper alpha via sigmoid so it decays toward 0 at high SNR:
             snr_threshold = float(power_cfg.get("snr_threshold", 5.0))
             snr_slope     = float(power_cfg.get("snr_slope", 0.3))
-            if current_snr_db is not None:
-                _arg = -snr_slope * (current_snr_db - snr_threshold)
-                _sig = float(torch.tensor([_arg]).sigmoid().item())
-                alpha = alpha_base * _sig
-            else:
-                alpha = alpha_base
+            alpha = _snr_adaptive_alpha(alpha_base, current_snr_db, snr_threshold, snr_slope)
             # ─────────────────────────────────────────────────────────
 
             if tx_signal is not None and mode_alloc_ctx is not None:
@@ -1594,9 +1594,7 @@ class CommModule(nn.Module):
                             # ── SNR-ADAPTIVE ALPHA TEMPERING (MMSE SIDE) ──────
                             _sp_snr_threshold = float(_sp_cfg.get("snr_threshold", 5.0))
                             _sp_snr_slope     = float(_sp_cfg.get("snr_slope", 0.3))
-                            _sp_arg = -_sp_snr_slope * (_curr_snr - _sp_snr_threshold)
-                            _sp_sig = float(torch.tensor([_sp_arg]).sigmoid().item())
-                            _sp_alpha = _sp_alpha_base * _sp_sig
+                            _sp_alpha = _snr_adaptive_alpha(_sp_alpha_base, _curr_snr, _sp_snr_threshold, _sp_snr_slope)
                             # ──────────────────────────────────────────────────
 
                             _bsz_sp = tx_signal.shape[0]

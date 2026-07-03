@@ -18,18 +18,222 @@ import torch.nn as nn
 import torch.nn.functional as F
 from timm.models import VisionTransformer
 from comm.comm_module_wrapper import CommModuleWrapper
+from methods.token_utils import gather_tokens, ClassTokenAttentionTrackerWrapper
 
 logger = logging.getLogger(__name__)
 
-from .gumbel.gumbel import sample_gumbel_topk
-from .gumbel.schedules import compute_tau
+
+# ============================================================
+# HELPER FUNCTIONS (from former methods/gumbel/ modules)
+# ============================================================
+
+# gather_tokens is now imported from methods.token_utils
+
+
+
+def compute_tau(step, tau_max=1.0, tau_min=0.3, num_steps=10000, anneal_mode="linear"):
+    """
+    Compute Gumbel-Softmax temperature tau based on annealing schedule.
+    
+    Args:
+        step: int, current global step
+        tau_max: float, initial temperature
+        tau_min: float, minimum temperature
+        num_steps: int, duration of annealing (in steps)
+        anneal_mode: str, "linear", "cosine", or "exp"
+    
+    Returns:
+        float: current tau
+    """
+    if step >= num_steps:
+        return tau_min
+        
+    t = step / float(num_steps) # 0 to 1
+    
+    if anneal_mode == 'linear':
+        # Linear decay from tau_max to tau_min
+        return tau_max - t * (tau_max - tau_min)
+        
+    elif anneal_mode == 'cosine':
+        # Cosine decay
+        # Starts at tau_max, ends at tau_min
+        cosine_decay = 0.5 * (1 + math.cos(math.pi * t))
+        return tau_min + (tau_max - tau_min) * cosine_decay
+        
+    elif anneal_mode == 'exp':
+        # Exponential decay
+        # tau = tau_max * (tau_min / tau_max)^t
+        return tau_max * (tau_min / tau_max)**t
+        
+    else:
+        # constant (or default fallback)
+        return tau_max
+
+
+def compute_gumbel_mc_scores(scores, num_samples=16, tau=0.5, aggregate="mean", generator=None):
+    """
+    Compute Monte-Carlo averaged token probabilities via repeated Gumbel perturbations.
+    
+    Args:
+        scores: [B, N-1] - Unnormalized log-probabilities.
+        num_samples: int - Number of MC samples.
+        tau: float - Gumbel temperature for eval.
+        aggregate: str - "mean" or "median" aggregation.
+        generator: torch.Generator for reproducibility.
+        
+    Returns:
+        p_mean: [B, N-1] - Aggregated probabilities.
+    """
+    B, num_patches = scores.shape
+    device = scores.device
+    
+    # Generate Gumbel noise for num_samples at once.
+    # shape: [num_samples, B, num_patches]
+    eps = 1e-20
+    if generator is None:
+        u = torch.rand((num_samples, B, num_patches), device=device)
+    else:
+        u = torch.rand((num_samples, B, num_patches), device='cpu', generator=generator).to(device)
+        
+    gumbel_noise = -torch.log(-torch.log(u + eps) + eps)
+    
+    # Expand scores to [num_samples, B, num_patches]
+    scores_expanded = scores.unsqueeze(0).expand(num_samples, -1, -1)
+    
+    # 1. Removal of Logarithm (Linear Sampling)
+    # 2. Decay Noise Amplitude: physical amplitude of noise decays with temperature
+    noisy_scores = scores_expanded + (gumbel_noise * tau)
+    
+    # 3. Exponential Amplification via 'Double Softmax'
+    p_soft = F.softmax(noisy_scores / tau, dim=-1)
+    
+    # Aggregate
+    if aggregate == "median":
+        p_agg, _ = p_soft.median(dim=0)
+    else:
+        p_agg = p_soft.mean(dim=0)
+        
+    return p_agg
+
+
+def sample_gumbel_from_scores(scores, n_alpha, tau=1.0, hard=True, straight_through=True, generator=None):
+    """
+    Perform Gumbel-Softmax sampling on given scores.
+    
+    Args:
+        scores: [B, N-1] - Unnormalized log-probabilities (or scores) for patch tokens.
+        n_alpha: int - Number of tokens to select.
+        tau: float - Gumbel temperature.
+        hard: bool - Hard selection.
+        straight_through: bool - ST estimation.
+        generator: torch.Generator.
+        
+    Returns:
+        indices_sel_patches: [B, n_alpha] (Relative indices 0..N-2)
+        m: [B, N-1] (Straight-through mask, or None)
+        gs_tau: float (Used tau)
+    """
+    B, num_patches = scores.shape
+    
+    # 1. Gumbel Noise
+    eps = 1e-20
+    if generator is None:
+         u = torch.rand_like(scores)
+    else:
+         u = torch.rand(scores.shape, device='cpu', generator=generator).to(scores.device)
+         
+    gumbel_noise = -torch.log(-torch.log(u + eps) + eps)
+    
+    # 2. Add noise with Decaying Amplitude
+    # 1. Removal of Logarithm: treat attention probabilities directly as linear inputs
+    noisy_scores = scores + (gumbel_noise * tau)
+    
+    # 3. Soft Probabilities - Exponential Amplification via 'Double Softmax'
+    # By omitting the logarithm, dividing the already-softmaxed linear scores by tau
+    # inside this second softmax converts micro-differences into explosive peaks.
+    m_soft = F.softmax(noisy_scores / tau, dim=-1)
+    
+    # 4. Hard Selection
+    _, topk_relative_indices = torch.topk(noisy_scores, k=n_alpha, dim=1, sorted=False)
+    
+    # 5. Straight-Through Mask
+    # Pure mathematical magnitude: we do NOT artificially scale the gradient by n_alpha,
+    # allowing the raw JSCC physics and true probabilities to drive the backpropagation.
+    m = None
+    if straight_through:
+        m_hard = torch.zeros_like(scores)
+        m_hard.scatter_(1, topk_relative_indices, 1.0)
+        m = m_hard + (m_soft - m_soft.detach())
+        
+    return topk_relative_indices, m, tau
+
+
+def sample_gumbel_topk(tokens, attn=None, n_alpha=1, tau=1.0, hard=True, straight_through=True, generator=None, scores=None):
+    """
+    Select top-k tokens based on CLS attention scores or explicit patch scores, with Gumbel noise.
+    
+    Args:
+        scores: [B, N-1] explicit scores for each patch token. If provided, attn is ignored.
+    """
+    B, N, D = tokens.shape
+    
+    # Handle already averaged attention
+    if attn is not None:
+        if attn.dim() == 4:
+            attn_mean = attn.mean(dim=1)
+        else:
+            attn_mean = attn
+        
+    # Validation
+    if n_alpha >= N - 1:
+        indices = torch.arange(N, device=tokens.device).unsqueeze(0).expand(B, -1)
+        return tokens, indices, None, tau
+        
+    if n_alpha <= 0:
+        indices = torch.zeros((B, 1), dtype=torch.long, device=tokens.device)
+        return gather_tokens(tokens, indices), indices, None, tau
+        
+    # Get scores
+    if scores is not None:
+        patch_scores = scores
+    elif attn is not None:
+        cls_scores = attn_mean[:, 0, :]
+        patch_scores = cls_scores[:, 1:] # [B, N-1]
+    else:
+        raise ValueError("Must provide either attn or scores to sample_gumbel_topk")
+    
+    # Use extracted function
+    topk_relative_indices, m, gs_tau = sample_gumbel_from_scores(
+        patch_scores, n_alpha, tau, hard, straight_through, generator
+    )
+    
+    # Convert to global indices
+    topk_indices = topk_relative_indices + 1
+    topk_indices, _ = torch.sort(topk_indices, dim=1)
+    
+    # Add CLS
+    cls_indices = torch.zeros((B, 1), dtype=torch.long, device=tokens.device)
+    indices_sel = torch.cat([cls_indices, topk_indices], dim=1)
+
+    # Gather
+    tokens_sel = gather_tokens(tokens, indices_sel)
+    
+    # Apply Straight-Through
+    if straight_through and m is not None:
+        sorted_relative_indices = topk_indices - 1
+        m_gathered = torch.gather(m, 1, sorted_relative_indices)
+        m_cls = torch.ones((B, 1), device=tokens.device, dtype=tokens.dtype)
+        m_final = torch.cat([m_cls, m_gathered], dim=1).unsqueeze(-1)
+        tokens_sel = tokens_sel * m_final
+        
+    return tokens_sel, indices_sel, patch_scores, gs_tau
 
 
 # ============================================================
 # BLOCK WRAPPER — Gumbel token selection at the split point
 # ============================================================
 
-class Gumbel_Token_Selection_Block_Wrapper(nn.Module):
+class GumbelTokenSelectorBlockWrapper(nn.Module):
     """
     Wraps a single ViT transformer block and performs Gumbel-Softmax
     token selection after the block's normal forward pass.
@@ -492,45 +696,16 @@ class Gumbel_Token_Selection_Block_Wrapper(nn.Module):
         return F.one_hot(labels, num_classes=num_classes).float()
 
 
-# ============================================================
-# Store_Class_Token_Attn_Wrapper  (unchanged)
-# ============================================================
+# ClassTokenAttentionTrackerWrapper is now imported from methods.token_utils
 
-class Store_Class_Token_Attn_Wrapper(nn.Module):
-    def __init__(self, attn):
-        super().__init__()
-        self.attn = attn
-        self.class_token_attention = None
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, N, C = x.shape
-
-        qkv = (self.attn.qkv(x)
-               .reshape(B, N, 3, self.attn.num_heads, self.attn.head_dim)
-               .permute(2, 0, 3, 1, 4))
-        q, k, v = qkv.unbind(0)
-        q, k = self.attn.q_norm(q), self.attn.k_norm(k)
-
-        q    = q * self.attn.scale
-        attn = q @ k.transpose(-2, -1)
-        attn = attn.softmax(dim=-1)
-
-        self.class_token_attention = attn[:, :, 0, :].mean(dim=1)   # [B, N]
-
-        attn = self.attn.attn_drop(attn)
-        attn_output = attn @ v
-        x = attn_output.transpose(1, 2).reshape(B, N, C)
-        x = self.attn.proj(x)
-        x = self.attn.proj_drop(x)
-        return x
 
 
 
 # ============================================================
-# Attn_Entropy_Wrapper — Server-side attention entropy capture
+# ServerAttentionEntropyTracker — Server-side attention entropy capture
 # ============================================================
 
-class Attn_Entropy_Wrapper(nn.Module):
+class ServerAttentionEntropyTracker(nn.Module):
     """
     Wraps a timm Attention module on the server side to capture
     the per-forward Shannon entropy of the softmax attention matrix.
@@ -592,7 +767,7 @@ class Attn_Entropy_Wrapper(nn.Module):
         x = self.attn.proj_drop(x)
         return x
 
-class model(nn.Module):
+class GumbelSplitLearningModel(nn.Module):
     def __init__(self,
                  model: VisionTransformer,
                  channel,
@@ -626,7 +801,7 @@ class model(nn.Module):
         self.clean_validation  = False
         # Initialise before build_model so the reference is available
         # if build_model needs it; populated inside build_model.
-        self._server_attn_wrappers: list = []  # list[Attn_Entropy_Wrapper]
+        self._server_attn_wrappers: list = []  # list[ServerAttentionEntropyTracker]
 
         self.model = self.build_model(model, channel, split_index, self.method_cfg)
         self.channel = channel
@@ -638,10 +813,10 @@ class model(nn.Module):
     # ------------------------------------------------------------------
 
     def build_model(self, model, channel, split_index, method_cfg):
-        model.blocks[split_index - 1].attn = Store_Class_Token_Attn_Wrapper(
+        model.blocks[split_index - 1].attn = ClassTokenAttentionTrackerWrapper(
             model.blocks[split_index - 1].attn
         )
-        model.blocks[split_index - 1] = Gumbel_Token_Selection_Block_Wrapper(
+        model.blocks[split_index - 1] = GumbelTokenSelectorBlockWrapper(
             block=model.blocks[split_index - 1],
             method_cfg=method_cfg
         )
@@ -663,14 +838,14 @@ class model(nn.Module):
             if not compression_enabled and hasattr(channel, "comm"):
                 channel.comm.use_bottleneck = False
 
-        # ── Install Attn_Entropy_Wrapper on server-side blocks ────────
+        # ── Install ServerAttentionEntropyTracker on server-side blocks ────────
         # Server blocks are those AFTER the channel in model.blocks.
         # model.blocks = [client_blocks..., channel, server_blocks...]
         # channel is at index split_index (0-based after rebuild).
         entropy_wrappers = []
         for block in blocks_after:
             if hasattr(block, 'attn'):
-                block.attn = Attn_Entropy_Wrapper(block.attn)
+                block.attn = ServerAttentionEntropyTracker(block.attn)
                 entropy_wrappers.append(block.attn)
         # Store reference on self for aggregation in forward()
         self._server_attn_wrappers = entropy_wrappers
@@ -689,7 +864,7 @@ class model(nn.Module):
         out = self.model.forward(x)
 
         # ── Aggregate server-side attention entropy ───────────────────
-        # After the forward pass, all Attn_Entropy_Wrapper instances have
+        # After the forward pass, all ServerAttentionEntropyTracker instances have
         # stored their per-block entropy in .last_entropy.  Compute the
         # global mean across all server blocks (single scalar per forward).
         if self._server_attn_wrappers:

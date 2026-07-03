@@ -5,9 +5,10 @@ import logging
 import weakref
 from timm.models import VisionTransformer
 from comm.comm_module_wrapper import CommModuleWrapper
+from methods.token_utils import gather_tokens, ClassTokenAttentionTrackerWrapper
 
 
-def select_random(tokens, n_alpha, generator=None, selection_cfg=None, pre_selected_indices=None):
+def sample_random_tokens(tokens, n_alpha, generator=None, selection_cfg=None, pre_selected_indices=None):
     """
     Select n_alpha random patch tokens + CLS.
     
@@ -238,38 +239,11 @@ def select_by_scores(tokens, scores, n_alpha, selection_cfg, embeddings=None, pr
 # MODEL INTERFACE CLASSES
 # =============================================================================
 
-class Store_Class_Token_Attn_Wrapper(nn.Module):
-    """
-    Wraps a timm attention module and stores CLS-row attention scores.
-    """
-    def __init__(self, attn):
-        super().__init__()
-        self.attn = attn
-        self.class_token_attention = None
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        bsz, n_tokens, channels = x.shape
-        qkv = (
-            self.attn.qkv(x)
-            .reshape(bsz, n_tokens, 3, self.attn.num_heads, self.attn.head_dim)
-            .permute(2, 0, 3, 1, 4)
-        )
-        q, k, v = qkv.unbind(0)
-        q, k = self.attn.q_norm(q), self.attn.k_norm(k)
-        q = q * self.attn.scale
-        attn = q @ k.transpose(-2, -1)
-        attn = attn.softmax(dim=-1)
-        # Shape [B, N]: mean over heads of CLS row attention.
-        self.class_token_attention = attn[:, :, 0, :].mean(dim=1)
-        attn = self.attn.attn_drop(attn)
-        attn_output = attn @ v
-        x = attn_output.transpose(1, 2).reshape(bsz, n_tokens, channels)
-        x = self.attn.proj(x)
-        x = self.attn.proj_drop(x)
-        return x
+# ClassTokenAttentionTrackerWrapper is now imported from methods.token_utils
 
 
-class Random_SP_Block_Wrapper(nn.Module):
+
+class RandomTokenSelectorBlockWrapper(nn.Module):
     """
     Selects random patch tokens with optional diversity and CLS-neighbor support.
     """
@@ -317,7 +291,7 @@ class Random_SP_Block_Wrapper(nn.Module):
                 pre_selected_indices = pre_selected_indices + 1 # global 1..N-1
 
         # Perform selection using local functions
-        tokens_sel, indices_sel, _ = select_random(
+        tokens_sel, indices_sel, _ = sample_random_tokens(
             tokens=x,
             n_alpha=n_alpha,
             generator=self.generator,
@@ -360,7 +334,7 @@ class Random_SP_Block_Wrapper(nn.Module):
         return F.one_hot(labels, num_classes=num_classes).float()
 
 
-class model(nn.Module):
+class RandomSelectionSplitModel(nn.Module):
     """
     Split-learning model using Random-SP token selection.
     """
@@ -393,12 +367,12 @@ class model(nn.Module):
 
     def build_model(self, model: VisionTransformer, channel, split_index: int, method_cfg: dict):
         # Wrap attention to capture CLS scores
-        model.blocks[split_index - 1].attn = Store_Class_Token_Attn_Wrapper(
+        model.blocks[split_index - 1].attn = ClassTokenAttentionTrackerWrapper(
             model.blocks[split_index - 1].attn
         )
 
         # Wrap block with selection logic
-        model.blocks[split_index - 1] = Random_SP_Block_Wrapper(
+        model.blocks[split_index - 1] = RandomTokenSelectorBlockWrapper(
             block=model.blocks[split_index - 1],
             method_cfg=method_cfg
         )
@@ -427,10 +401,5 @@ class model(nn.Module):
             self.communication += self.compression_ratio * x.shape[0]
         return self.model.forward(x)
 
-def gather_tokens(tokens, indices):
-    """
-    Gather tokens based on indices. [B, N, D] -> [B, K, D]
-    """
-    B, N, D = tokens.shape
-    indices_expanded = indices.unsqueeze(-1).expand(-1, -1, D)
-    return torch.gather(tokens, 1, indices_expanded)
+# gather_tokens is now imported from methods.token_utils
+

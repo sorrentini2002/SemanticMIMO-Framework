@@ -9,7 +9,7 @@
 #   - reconfigure()     →  eval-time SNR sweep
 #
 # Score alignment contract (Componente 3 of impl. plan):
-#   - Store_Class_Token_Attn_Wrapper saves class_token_attention
+#   - ClassTokenAttentionTrackerWrapper saves class_token_attention
 #     of shape [B, N] where position 0 is the CLS token row.
 #   - CommModule expects selection_scores of shape [B, N_patches]
 #     or [B, N_tokens] (it handles both via _resolve_power_scores).
@@ -226,11 +226,6 @@ class CommModuleWrapper(nn.Module):
             wandb.log(ch_stats)
         """
         return dict(self.last_info)
-        
-    def reconfigure(self, config_update: dict):
-        """Passes the configuration dictates (like SNR) down to the internal CommModule."""
-        if hasattr(self.comm, "reconfigure"):
-            self.comm.reconfigure(config_update)
 
     def set_channel_eval_only(self, enabled: bool) -> None:
         """

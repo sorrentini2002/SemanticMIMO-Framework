@@ -1,5 +1,5 @@
 model:
-  _target_: methods.gumbel_method.model
+  _target_: methods.gumbel_method.GumbelSplitLearningModel
   method_cfg: ${method.parameters}
 name: gumbel
 parameters:
